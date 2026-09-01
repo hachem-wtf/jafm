@@ -14,7 +14,8 @@ CFLAGS := -Wall \
           -std=c17 \
           -Isrc
 
-LDFLAGS := -fsanitize=address,undefined
+LDFLAGS := -fsanitize=address,undefined \
+           -lz
 
 CPPCHECKFLAGS := --project=compile_commands.json \
                  --enable=warning,style,performance,portability \

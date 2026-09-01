@@ -1,8 +1,70 @@
 #include <dirent.h>
+#include <zlib.h>
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
-static void list_pages(const char* section)
+#define LINE_SIZE 8192
+
+static bool ends_with(const char* string, const char* suffix)
+{
+    size_t string_length = strlen(string);
+    size_t suffix_length = strlen(suffix);
+
+    if (suffix_length > string_length)
+        return false;
+
+    return strcmp(string + string_length - suffix_length, suffix) == 0;
+}
+
+static bool plain_page_contains(const char* path, const char* query)
+{
+    FILE* page = fopen(path, "r");
+    if (page == NULL)
+        return false;
+
+    char line[LINE_SIZE];
+    bool found = false;
+    while (fgets(line, sizeof(line), page) != NULL)
+        if (strstr(line, query) != NULL)
+        {
+            found = true;
+            break;
+        }
+
+    (void) fclose(page);
+    return found;
+}
+
+static bool gzip_page_contains(const char* path, const char* query)
+{
+    gzFile page = gzopen(path, "r");
+    if (page == NULL)
+        return false;
+
+    char line[LINE_SIZE];
+    bool found = false;
+    while (gzgets(page, line, LINE_SIZE) != NULL)
+        if (strstr(line, query) != NULL)
+        {
+            found = true;
+            break;
+        }
+
+    (void) gzclose(page);
+    return found;
+}
+
+static bool page_contains(const char* path, const char* query)
+{
+    if (ends_with(path, ".gz"))
+        return gzip_page_contains(path, query);
+
+    return plain_page_contains(path, query);
+}
+
+static void list_pages(const char* section, const char* query)
 {
     DIR* section_stream = opendir(section);
     if (section_stream == NULL)
@@ -12,12 +74,17 @@ static void list_pages(const char* section)
          entry != NULL;
          entry = readdir(section_stream))
         if (entry->d_name[0] != '.')
-            (void) printf("    page: %s/%s\n", section, entry->d_name);
+        {
+            char path[4096];
+            (void) snprintf(path, sizeof(path), "%s/%s", section, entry->d_name);
+            if (page_contains(path, query))
+                (void) printf("    match: %s\n", path);
+        }
 
     (void) closedir(section_stream);
 }
 
-static void list_sections(const char* directory)
+static void list_sections(const char* directory, const char* query)
 {
     DIR* directory_stream = opendir(directory);
     if (directory_stream == NULL)
@@ -30,7 +97,7 @@ static void list_sections(const char* directory)
         {
             char section[4096];
             (void) snprintf(section, sizeof(section), "%s/%s", directory, entry->d_name);
-            list_pages(section);
+            list_pages(section, query);
         }
 
     (void) closedir(directory_stream);
@@ -72,8 +139,7 @@ int main(int argc, char** argv)
          directory != NULL;
          directory = strtok_r(NULL, ":", &save_pointer))
     {
-        (void) printf("man dir: %s\n", directory);
-        list_sections(directory);
+        list_sections(directory, query);
     }
 
     return 0;
