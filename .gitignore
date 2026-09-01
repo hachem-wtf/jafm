@@ -1,6 +1,6 @@
 bin/
 
-compile_options.json
+compile_commands.json
 compile_flags.txt
 .clangd
 
