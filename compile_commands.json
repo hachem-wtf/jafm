@@ -1,0 +1,27 @@
+[
+  {
+    "file": "src/main.c",
+    "arguments": [
+      "/opt/homebrew/opt/llvm/bin/clang",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Wconversion",
+      "-Wsign-conversion",
+      "-Wshadow",
+      "-Wstrict-prototypes",
+      "-Wmissing-prototypes",
+      "-g",
+      "-fno-omit-frame-pointer",
+      "-fsanitize=address,undefined",
+      "-std=c17",
+      "-Isrc",
+      "-c",
+      "src/main.c",
+      "-o",
+      "bin/main.o"
+    ],
+    "directory": "/Users/hachem/dev/jafm",
+    "output": "bin/main.o"
+  }
+]

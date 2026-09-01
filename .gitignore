@@ -1,0 +1,8 @@
+bin/
+
+compile_options.json
+compile_flags.txt
+.clangd
+
+.DS_Store
+
