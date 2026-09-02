@@ -14,18 +14,16 @@
 #define LINE_SIZE 8192
 #define MAX_VISIBLE 12
 
-enum Rank
-{
-    RANK_FILENAME,
-    RANK_NAME,
-    RANK_BODY,
-    RANK_NONE
-};
+#define WEIGHT_FILENAME   1000000
+#define WEIGHT_NAME       5000
+#define WEIGHT_DEFINITION 2000
+#define WEIGHT_SYNOPSIS   50
+#define WEIGHT_BODY       1
 
 struct Match
 {
     char* path;
-    enum Rank rank;
+    long score;
 };
 
 struct MatchList
@@ -35,7 +33,7 @@ struct MatchList
     size_t capacity;
 };
 
-static bool match_list_add(struct MatchList* matches, const char* path, enum Rank rank)
+static bool match_list_add(struct MatchList* matches, const char* path, long score)
 {
     if (matches->count == matches->capacity)
     {
@@ -54,7 +52,7 @@ static bool match_list_add(struct MatchList* matches, const char* path, enum Ran
         return false;
 
     matches->items[matches->count].path = copy;
-    matches->items[matches->count].rank = rank;
+    matches->items[matches->count].score = score;
     matches->count++;
     return true;
 }
@@ -72,8 +70,8 @@ static int compare_matches(const void* left, const void* right)
     const struct Match* first = left;
     const struct Match* second = right;
 
-    if (first->rank != second->rank)
-        return first->rank < second->rank ? -1 : 1;
+    if (first->score != second->score)
+        return first->score > second->score ? -1 : 1;
 
     return strcmp(first->path, second->path);
 }
@@ -94,71 +92,126 @@ static bool is_section_header(const char* line)
     return strncmp(line, ".SH", 3) == 0 || strncmp(line, ".Sh", 3) == 0;
 }
 
-static void classify_line(const char* line, const char* query, bool* in_name,
-                          bool* found_name, bool* found_body)
+static bool is_definition_line(const char* line)
+{
+    if (strchr(line, '{') == NULL)
+        return false;
+
+    return strstr(line, "struct") != NULL || strstr(line, "union") != NULL
+           || strstr(line, "enum") != NULL || strstr(line, "typedef") != NULL;
+}
+
+static long count_occurrences(const char* line, const char* query)
+{
+    size_t query_length = strlen(query);
+    if (query_length == 0)
+        return 0;
+
+    long count = 0;
+    for (const char* cursor = strstr(line, query);
+         cursor != NULL;
+         cursor = strstr(cursor + query_length, query))
+        count++;
+
+    return count;
+}
+
+struct Scan
+{
+    bool in_name;
+    bool in_synopsis;
+    long name_hits;
+    long definition_hits;
+    long synopsis_hits;
+    long body_hits;
+};
+
+static void scan_line(struct Scan* scan, const char* line, const char* query)
 {
     if (is_section_header(line))
-        *in_name = strstr(line, "NAME") != NULL;
+    {
+        scan->in_name = strstr(line, "NAME") != NULL;
+        scan->in_synopsis = strstr(line, "SYNOPSIS") != NULL;
+        return;
+    }
 
-    if (strstr(line, query) == NULL)
+    long hits = count_occurrences(line, query);
+    if (hits == 0)
         return;
 
-    *found_body = true;
-    if (*in_name || strncmp(line, ".Nm", 3) == 0)
-        *found_name = true;
+    if (scan->in_name || strncmp(line, ".Nm", 3) == 0)
+        scan->name_hits += hits;
+    else if (is_definition_line(line))
+        scan->definition_hits += hits;
+    else if (scan->in_synopsis)
+        scan->synopsis_hits += hits;
+    else
+        scan->body_hits += hits;
 }
 
-static enum Rank rank_from(bool found_name, bool found_body)
+static long scan_score(const struct Scan* scan)
 {
-    if (found_name)
-        return RANK_NAME;
-
-    if (found_body)
-        return RANK_BODY;
-
-    return RANK_NONE;
+    return scan->name_hits * WEIGHT_NAME + scan->definition_hits * WEIGHT_DEFINITION
+           + scan->synopsis_hits * WEIGHT_SYNOPSIS + scan->body_hits * WEIGHT_BODY;
 }
 
-static enum Rank plain_page_rank(const char* path, const char* query)
+static long plain_page_score(const char* path, const char* query)
 {
     FILE* page = fopen(path, "r");
     if (page == NULL)
-        return RANK_NONE;
+        return 0;
 
+    struct Scan scan = {0};
     char line[LINE_SIZE];
-    bool in_name = false;
-    bool found_name = false;
-    bool found_body = false;
     while (fgets(line, sizeof(line), page) != NULL)
-        classify_line(line, query, &in_name, &found_name, &found_body);
+        scan_line(&scan, line, query);
 
     (void) fclose(page);
-    return rank_from(found_name, found_body);
+    return scan_score(&scan);
 }
 
-static enum Rank gzip_page_rank(const char* path, const char* query)
+static long gzip_page_score(const char* path, const char* query)
 {
     gzFile page = gzopen(path, "r");
     if (page == NULL)
-        return RANK_NONE;
+        return 0;
 
+    struct Scan scan = {0};
     char line[LINE_SIZE];
-    bool in_name = false;
-    bool found_name = false;
-    bool found_body = false;
     while (gzgets(page, line, LINE_SIZE) != NULL)
-        classify_line(line, query, &in_name, &found_name, &found_body);
+        scan_line(&scan, line, query);
 
     (void) gzclose(page);
-    return rank_from(found_name, found_body);
+    return scan_score(&scan);
 }
 
-static enum Rank page_rank(const char* path, const char* query)
+static long page_score(const char* path, const char* query)
 {
     if (ends_with(path, ".gz"))
-        return gzip_page_rank(path, query);
+        return gzip_page_score(path, query);
 
-    return plain_page_rank(path, query);
+    return plain_page_score(path, query);
+}
+
+static long section_weight(const char* section)
+{
+    const char* name = strrchr(section, '/');
+    name = name != NULL ? name + 1 : section;
+    if (strncmp(name, "man", 3) == 0)
+        name += 3;
+
+    switch (name[0])
+    {
+        case '0':
+        case '2':
+        case '4':
+        case '5':
+        case '7':
+        case '9':
+            return 8;
+        default:
+            return 1;
+    }
 }
 
 static bool filename_matches(const char* name, const char* query)
@@ -399,14 +452,12 @@ static void list_pages(const char* section, const char* query, struct MatchList*
             char path[4096];
             (void) snprintf(path, sizeof(path), "%s/%s", section, entry->d_name);
 
+            long score = page_score(path, query) * section_weight(section);
             if (filename_matches(entry->d_name, query))
-                (void) match_list_add(matches, path, RANK_FILENAME);
-            else
-            {
-                enum Rank rank = page_rank(path, query);
-                if (rank != RANK_NONE)
-                    (void) match_list_add(matches, path, rank);
-            }
+                score += WEIGHT_FILENAME;
+
+            if (score > 0)
+                (void) match_list_add(matches, path, score);
         }
 
     (void) closedir(section_stream);
@@ -429,6 +480,43 @@ static void list_sections(const char* directory, const char* query, struct Match
         }
 
     (void) closedir(directory_stream);
+}
+
+static void dedupe_matches(struct MatchList* matches)
+{
+    if (matches->count == 0)
+        return;
+
+    char (*labels)[256] = malloc(matches->count * sizeof(*labels));
+    if (labels == NULL)
+        return;
+
+    size_t write = 0;
+    for (size_t read = 0; read < matches->count; read++)
+    {
+        char label[256];
+        page_label(matches->items[read].path, label, sizeof(label));
+
+        bool seen = false;
+        for (size_t index = 0; index < write; index++)
+            if (strcmp(labels[index], label) == 0)
+            {
+                seen = true;
+                break;
+            }
+
+        if (seen)
+            free(matches->items[read].path);
+        else
+        {
+            (void) snprintf(labels[write], sizeof(labels[write]), "%s", label);
+            matches->items[write] = matches->items[read];
+            write++;
+        }
+    }
+
+    free(labels);
+    matches->count = write;
 }
 
 static int open_page(const char* path)
@@ -512,6 +600,7 @@ int main(int argc, char** argv)
     }
 
     qsort(matches.items, matches.count, sizeof(struct Match), compare_matches);
+    dedupe_matches(&matches);
 
     size_t selected = 0;
     bool has_selection;
