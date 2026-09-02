@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -12,8 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LINE_SIZE 8192
 #define MAX_VISIBLE 12
+#define WORKER_THREADS 8
+#define MAX_WORKER_THREADS 64
 #define SYMBOL_SIZE 128
 #define KIND_SIZE 16
 
@@ -256,39 +258,111 @@ static long scan_score(const struct Scan* scan)
            + scan->synopsis_hits * WEIGHT_SYNOPSIS + scan->body_hits * WEIGHT_BODY;
 }
 
-static void plain_page_scan(const char* path, const char* query, struct Scan* scan)
+static char* read_plain(const char* path)
 {
-    FILE* page = fopen(path, "r");
+    FILE* page = fopen(path, "rb");
     if (page == NULL)
-        return;
+        return NULL;
 
-    char line[LINE_SIZE];
-    while (fgets(line, sizeof(line), page) != NULL)
-        scan_line(scan, line, query);
+    size_t capacity = 65536;
+    size_t length = 0;
+    char* buffer = malloc(capacity);
+    if (buffer == NULL)
+    {
+        (void) fclose(page);
+        return NULL;
+    }
+
+    for (;;)
+    {
+        size_t got = fread(buffer + length, 1, capacity - length - 1, page);
+        length += got;
+        if (length + 1 < capacity)
+            break;
+
+        capacity *= 2;
+        char* grown = realloc(buffer, capacity);
+        if (grown == NULL)
+        {
+            free(buffer);
+            (void) fclose(page);
+            return NULL;
+        }
+        buffer = grown;
+    }
 
     (void) fclose(page);
+    buffer[length] = '\0';
+    return buffer;
 }
 
-static void gzip_page_scan(const char* path, const char* query, struct Scan* scan)
+static char* read_gzip(const char* path)
 {
-    gzFile page = gzopen(path, "r");
+    gzFile page = gzopen(path, "rb");
     if (page == NULL)
-        return;
+        return NULL;
 
-    char line[LINE_SIZE];
-    while (gzgets(page, line, LINE_SIZE) != NULL)
-        scan_line(scan, line, query);
+    size_t capacity = 65536;
+    size_t length = 0;
+    char* buffer = malloc(capacity);
+    if (buffer == NULL)
+    {
+        (void) gzclose(page);
+        return NULL;
+    }
+
+    for (;;)
+    {
+        int got = gzread(page, buffer + length, (unsigned) (capacity - length - 1));
+        if (got <= 0)
+            break;
+
+        length += (size_t) got;
+        if (length + 1 < capacity)
+            continue;
+
+        capacity *= 2;
+        char* grown = realloc(buffer, capacity);
+        if (grown == NULL)
+        {
+            free(buffer);
+            (void) gzclose(page);
+            return NULL;
+        }
+        buffer = grown;
+    }
 
     (void) gzclose(page);
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static void scan_buffer(char* buffer, const char* query, struct Scan* scan)
+{
+    if (strstr(buffer, query) == NULL)
+        return;
+
+    char* line = buffer;
+    while (line != NULL && *line != '\0')
+    {
+        char* newline = strchr(line, '\n');
+        if (newline != NULL)
+            *newline = '\0';
+
+        scan_line(scan, line, query);
+        line = newline != NULL ? newline + 1 : NULL;
+    }
 }
 
 static void page_find(const char* path, const char* query, struct Finding* finding)
 {
+    char* buffer = ends_with(path, ".gz") ? read_gzip(path) : read_plain(path);
+    if (buffer == NULL)
+        return;
+
     struct Scan scan = {0};
-    if (ends_with(path, ".gz"))
-        gzip_page_scan(path, query, &scan);
-    else
-        plain_page_scan(path, query, &scan);
+    scan_buffer(buffer, query, &scan);
+    free(buffer);
 
     finding->score = scan_score(&scan);
     (void) snprintf(finding->symbol, sizeof(finding->symbol), "%s", scan.symbol);
@@ -552,12 +626,58 @@ static bool read_selection(size_t count, size_t* selected)
     return true;
 }
 
-static void list_pages(const char* section, const char* query, struct MatchList* matches)
+struct Task
+{
+    char* path;
+    long weight;
+};
+
+struct TaskList
+{
+    struct Task* items;
+    size_t count;
+    size_t capacity;
+};
+
+static bool task_list_add(struct TaskList* tasks, const char* path, long weight)
+{
+    if (tasks->count == tasks->capacity)
+    {
+        size_t new_capacity = tasks->capacity == 0 ? 1024 : tasks->capacity * 2;
+        struct Task* grown =
+            realloc(tasks->items, new_capacity * sizeof(struct Task));
+        if (grown == NULL)
+            return false;
+
+        tasks->items = grown;
+        tasks->capacity = new_capacity;
+    }
+
+    char* copy = strdup(path);
+    if (copy == NULL)
+        return false;
+
+    tasks->items[tasks->count].path = copy;
+    tasks->items[tasks->count].weight = weight;
+    tasks->count++;
+    return true;
+}
+
+static void task_list_free(struct TaskList* tasks)
+{
+    for (size_t index = 0; index < tasks->count; index++)
+        free(tasks->items[index].path);
+
+    free(tasks->items);
+}
+
+static void collect_pages(const char* section, struct TaskList* tasks)
 {
     DIR* section_stream = opendir(section);
     if (section_stream == NULL)
         return;
 
+    long weight = section_weight(section);
     for (const struct dirent* entry = readdir(section_stream);
          entry != NULL;
          entry = readdir(section_stream))
@@ -565,28 +685,13 @@ static void list_pages(const char* section, const char* query, struct MatchList*
         {
             char path[4096];
             (void) snprintf(path, sizeof(path), "%s/%s", section, entry->d_name);
-
-            struct Finding finding = {0};
-            page_find(path, query, &finding);
-
-            long score = finding.score * section_weight(section);
-            if (filename_matches(entry->d_name, query))
-            {
-                score += WEIGHT_FILENAME;
-                if (finding.symbol[0] == '\0')
-                    (void) snprintf(finding.symbol, sizeof(finding.symbol), "%s",
-                                    query);
-            }
-
-            if (score > 0)
-                (void) match_list_add(matches, path, score, finding.symbol,
-                                      finding.kind);
+            (void) task_list_add(tasks, path, weight);
         }
 
     (void) closedir(section_stream);
 }
 
-static void list_sections(const char* directory, const char* query, struct MatchList* matches)
+static void collect_sections(const char* directory, struct TaskList* tasks)
 {
     DIR* directory_stream = opendir(directory);
     if (directory_stream == NULL)
@@ -599,10 +704,107 @@ static void list_sections(const char* directory, const char* query, struct Match
         {
             char section[4096];
             (void) snprintf(section, sizeof(section), "%s/%s", directory, entry->d_name);
-            list_pages(section, query, matches);
+            collect_pages(section, tasks);
         }
 
     (void) closedir(directory_stream);
+}
+
+static void scan_task(const struct Task* task, const char* query,
+                      struct MatchList* matches)
+{
+    const char* path = task->path;
+    struct Finding finding = {0};
+    page_find(path, query, &finding);
+
+    long score = finding.score * task->weight;
+
+    const char* base = strrchr(path, '/');
+    base = base != NULL ? base + 1 : path;
+    if (filename_matches(base, query))
+    {
+        score += WEIGHT_FILENAME;
+        if (finding.symbol[0] == '\0')
+            (void) snprintf(finding.symbol, sizeof(finding.symbol), "%s", query);
+    }
+
+    if (score > 0)
+        (void) match_list_add(matches, path, score, finding.symbol, finding.kind);
+}
+
+struct Worker
+{
+    const struct Task* tasks;
+    size_t start;
+    size_t end;
+    const char* query;
+    struct MatchList matches;
+};
+
+static void* worker_main(void* argument)
+{
+    struct Worker* worker = argument;
+    for (size_t index = worker->start; index < worker->end; index++)
+        scan_task(&worker->tasks[index], worker->query, &worker->matches);
+
+    return NULL;
+}
+
+static size_t worker_count(size_t task_count, size_t requested)
+{
+    size_t count = requested == 0 ? WORKER_THREADS : requested;
+    if (count > MAX_WORKER_THREADS)
+        count = MAX_WORKER_THREADS;
+    if (count > task_count)
+        count = task_count;
+
+    return count == 0 ? 1 : count;
+}
+
+static void scan_tasks(const struct TaskList* tasks, const char* query,
+                       struct MatchList* matches, size_t requested)
+{
+    size_t threads = worker_count(tasks->count, requested);
+
+    struct Worker* workers = calloc(threads, sizeof(struct Worker));
+    pthread_t* handles = calloc(threads, sizeof(pthread_t));
+    if (workers == NULL || handles == NULL)
+    {
+        free(workers);
+        free(handles);
+        return;
+    }
+
+    size_t per_thread = tasks->count / threads;
+    size_t remainder = tasks->count % threads;
+    size_t offset = 0;
+    for (size_t index = 0; index < threads; index++)
+    {
+        size_t chunk = per_thread + (index < remainder ? 1 : 0);
+        workers[index].tasks = tasks->items;
+        workers[index].start = offset;
+        workers[index].end = offset + chunk;
+        workers[index].query = query;
+        offset += chunk;
+        (void) pthread_create(&handles[index], NULL, worker_main, &workers[index]);
+    }
+
+    for (size_t index = 0; index < threads; index++)
+    {
+        (void) pthread_join(handles[index], NULL);
+
+        struct MatchList* partial = &workers[index].matches;
+        for (size_t item = 0; item < partial->count; item++)
+            (void) match_list_add(matches, partial->items[item].path,
+                                  partial->items[item].score,
+                                  partial->items[item].symbol,
+                                  partial->items[item].kind);
+
+        match_list_free(partial);
+    }
+
+    free(workers);
+    free(handles);
 }
 
 static void dedupe_matches(struct MatchList* matches)
@@ -680,13 +882,35 @@ static int open_page(const char* path)
 
 int main(int argc, char** argv)
 {
-    if (argc != 2)
+    size_t requested_threads = 0;
+
+    for (int option = getopt(argc, argv, "j:"); option != -1;
+         option = getopt(argc, argv, "j:"))
     {
-        (void) fprintf(stderr, "usage: %s <symbol>\n", argv[0]);
+        if (option != 'j')
+        {
+            (void) fprintf(stderr, "usage: %s [-j threads] <symbol>\n", argv[0]);
+            return 1;
+        }
+
+        char* end = NULL;
+        long value = strtol(optarg, &end, 10);
+        if (end == optarg || *end != '\0' || value < 1)
+        {
+            (void) fprintf(stderr, "jafm: invalid thread count: %s\n", optarg);
+            return 1;
+        }
+
+        requested_threads = (size_t) value;
+    }
+
+    if (optind != argc - 1)
+    {
+        (void) fprintf(stderr, "usage: %s [-j threads] <symbol>\n", argv[0]);
         return 1;
     }
 
-    const char* query = argv[1];
+    const char* query = argv[optind];
 
     FILE* manpath_pipe = popen("manpath", "r");
     if (manpath_pipe == NULL)
@@ -707,13 +931,17 @@ int main(int argc, char** argv)
 
     buffer[strcspn(buffer, "\n")] = '\0';
 
-    struct MatchList matches = {0};
+    struct TaskList tasks = {0};
 
     char* save_pointer = NULL;
     for (const char* directory = strtok_r(buffer, ":", &save_pointer);
          directory != NULL;
          directory = strtok_r(NULL, ":", &save_pointer))
-        list_sections(directory, query, &matches);
+        collect_sections(directory, &tasks);
+
+    struct MatchList matches = {0};
+    scan_tasks(&tasks, query, &matches, requested_threads);
+    task_list_free(&tasks);
 
     if (matches.count == 0)
     {

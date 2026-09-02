@@ -1,24 +1,35 @@
 CC := clang
 
-CFLAGS := -Wall \
-          -Wextra \
-          -Wpedantic \
-          -Wconversion \
-          -Wsign-conversion \
-          -Wshadow \
-          -Wstrict-prototypes \
-          -Wmissing-prototypes \
-          -g \
-          -fno-omit-frame-pointer \
-          -fsanitize=address,undefined \
+WARNINGS := -Wall -Wextra        \
+            -Wshadow -Wpedantic  \
+            -Wconversion         \
+            -Wstrict-prototypes  \
+            -Wmissing-prototypes \
+            -Wsign-conversion
+
+CFLAGS := $(WARNINGS) \
+          -O2        \
+          -pthread   \
           -std=c17
 
-LDFLAGS := -fsanitize=address,undefined \
-           -lz
+LDFLAGS := -lz \
+           -pthread
 
-CPPCHECKFLAGS := --project=compile_commands.json \
-                 --enable=warning,style,performance,portability \
-                 --error-exitcode=1
+DEBUGFLAGS := $(WARNINGS) \
+              -g         \
+              -O0        \
+              -pthread   \
+              -std=c17   \
+              -fno-omit-frame-pointer \
+              -fsanitize=address,undefined
+
+DEBUGLDFLAGS := -lz \
+                -pthread \
+                -fsanitize=address,undefined
+
+CPPCHECKFLAGS := --error-exitcode=1              \
+                 --project=compile_commands.json \
+                 --enable=warning,style,performance,portability
 
 TARGET := jafm
 SRC := jafm.c
@@ -28,11 +39,15 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
 
+debug: $(SRC)
+	$(CC) $(DEBUGFLAGS) $(SRC) -o $(TARGET) $(DEBUGLDFLAGS)
+
 check:
-	bear -- make clean all
+	bear -- make clean debug
 	cppcheck $(CPPCHECKFLAGS)
 
 clean:
 	rm -rf $(TARGET) $(TARGET).dSYM
 
-.PHONY: all check clean
+.PHONY: all debug check clean
+
