@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,13 @@
 
 #define LINE_SIZE 8192
 #define MAX_VISIBLE 12
+#define SYMBOL_SIZE 128
+#define KIND_SIZE 16
+
+#define TIER_BODY       1
+#define TIER_SYNOPSIS   2
+#define TIER_DEFINITION 3
+#define TIER_NAME       4
 
 #define WEIGHT_FILENAME   1000000
 #define WEIGHT_NAME       5000
@@ -24,6 +32,8 @@ struct Match
 {
     char* path;
     long score;
+    char symbol[SYMBOL_SIZE];
+    char kind[KIND_SIZE];
 };
 
 struct MatchList
@@ -33,7 +43,8 @@ struct MatchList
     size_t capacity;
 };
 
-static bool match_list_add(struct MatchList* matches, const char* path, long score)
+static bool match_list_add(struct MatchList* matches, const char* path, long score,
+                           const char* symbol, const char* kind)
 {
     if (matches->count == matches->capacity)
     {
@@ -51,8 +62,11 @@ static bool match_list_add(struct MatchList* matches, const char* path, long sco
     if (copy == NULL)
         return false;
 
-    matches->items[matches->count].path = copy;
-    matches->items[matches->count].score = score;
+    struct Match* item = &matches->items[matches->count];
+    item->path = copy;
+    item->score = score;
+    (void) snprintf(item->symbol, sizeof(item->symbol), "%s", symbol);
+    (void) snprintf(item->kind, sizeof(item->kind), "%s", kind);
     matches->count++;
     return true;
 }
@@ -116,6 +130,63 @@ static long count_occurrences(const char* line, const char* query)
     return count;
 }
 
+static bool is_identifier_char(char character)
+{
+    return isalnum((unsigned char) character) || character == '_';
+}
+
+static void extract_symbol(const char* line, const char* query, char* symbol,
+                           size_t symbol_size)
+{
+    const char* found = strstr(line, query);
+    if (found == NULL)
+        return;
+
+    const char* start = found;
+    while (start > line && is_identifier_char(start[-1]))
+        start--;
+
+    const char* end = found + strlen(query);
+    while (is_identifier_char(*end))
+        end++;
+
+    size_t length = (size_t) (end - start);
+    if (length >= symbol_size)
+        length = symbol_size - 1;
+
+    memcpy(symbol, start, length);
+    symbol[length] = '\0';
+}
+
+static void classify_kind(const char* line, const char* symbol, char* kind,
+                          size_t kind_size)
+{
+    const char* word = NULL;
+    if (strstr(line, "struct") != NULL)
+        word = "struct";
+    else if (strstr(line, "union") != NULL)
+        word = "union";
+    else if (strstr(line, "enum") != NULL)
+        word = "enum";
+    else if (strstr(line, "typedef") != NULL)
+        word = "typedef";
+
+    if (word == NULL && symbol[0] != '\0')
+    {
+        const char* after = strstr(line, symbol);
+        if (after != NULL)
+        {
+            after += strlen(symbol);
+            while (*after == ' ' || *after == '\t')
+                after++;
+            if (*after == '(')
+                word = "function";
+        }
+    }
+
+    (void) snprintf(kind, kind_size, "%s", word != NULL ? word : "symbol");
+}
+
 struct Scan
 {
     bool in_name;
@@ -124,6 +195,16 @@ struct Scan
     long definition_hits;
     long synopsis_hits;
     long body_hits;
+    int best_tier;
+    char symbol[SYMBOL_SIZE];
+    char kind[KIND_SIZE];
+};
+
+struct Finding
+{
+    long score;
+    char symbol[SYMBOL_SIZE];
+    char kind[KIND_SIZE];
 };
 
 static void scan_line(struct Scan* scan, const char* line, const char* query)
@@ -139,14 +220,34 @@ static void scan_line(struct Scan* scan, const char* line, const char* query)
     if (hits == 0)
         return;
 
+    int tier;
     if (scan->in_name || strncmp(line, ".Nm", 3) == 0)
+    {
         scan->name_hits += hits;
+        tier = TIER_NAME;
+    }
     else if (is_definition_line(line))
+    {
         scan->definition_hits += hits;
+        tier = TIER_DEFINITION;
+    }
     else if (scan->in_synopsis)
+    {
         scan->synopsis_hits += hits;
+        tier = TIER_SYNOPSIS;
+    }
     else
+    {
         scan->body_hits += hits;
+        tier = TIER_BODY;
+    }
+
+    if (tier > scan->best_tier)
+    {
+        scan->best_tier = tier;
+        extract_symbol(line, query, scan->symbol, sizeof(scan->symbol));
+        classify_kind(line, scan->symbol, scan->kind, sizeof(scan->kind));
+    }
 }
 
 static long scan_score(const struct Scan* scan)
@@ -155,42 +256,43 @@ static long scan_score(const struct Scan* scan)
            + scan->synopsis_hits * WEIGHT_SYNOPSIS + scan->body_hits * WEIGHT_BODY;
 }
 
-static long plain_page_score(const char* path, const char* query)
+static void plain_page_scan(const char* path, const char* query, struct Scan* scan)
 {
     FILE* page = fopen(path, "r");
     if (page == NULL)
-        return 0;
+        return;
 
-    struct Scan scan = {0};
     char line[LINE_SIZE];
     while (fgets(line, sizeof(line), page) != NULL)
-        scan_line(&scan, line, query);
+        scan_line(scan, line, query);
 
     (void) fclose(page);
-    return scan_score(&scan);
 }
 
-static long gzip_page_score(const char* path, const char* query)
+static void gzip_page_scan(const char* path, const char* query, struct Scan* scan)
 {
     gzFile page = gzopen(path, "r");
     if (page == NULL)
-        return 0;
+        return;
 
-    struct Scan scan = {0};
     char line[LINE_SIZE];
     while (gzgets(page, line, LINE_SIZE) != NULL)
-        scan_line(&scan, line, query);
+        scan_line(scan, line, query);
 
     (void) gzclose(page);
-    return scan_score(&scan);
 }
 
-static long page_score(const char* path, const char* query)
+static void page_find(const char* path, const char* query, struct Finding* finding)
 {
+    struct Scan scan = {0};
     if (ends_with(path, ".gz"))
-        return gzip_page_score(path, query);
+        gzip_page_scan(path, query, &scan);
+    else
+        plain_page_scan(path, query, &scan);
 
-    return plain_page_score(path, query);
+    finding->score = scan_score(&scan);
+    (void) snprintf(finding->symbol, sizeof(finding->symbol), "%s", scan.symbol);
+    (void) snprintf(finding->kind, sizeof(finding->kind), "%s", scan.kind);
 }
 
 static long section_weight(const char* section)
@@ -315,11 +417,23 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
         char label[256];
         page_label(matches->items[index].path, label, sizeof(label));
 
-        if (index == highlight)
-            (void) printf("\x1b[2K  \x1b[36m\xe2\x9d\xaf\x1b[0m \x1b[1m%s\x1b[0m\r\n",
-                          label);
+        const char* symbol = matches->items[index].symbol;
+        const char* kind = matches->items[index].kind;
+
+        char detail[SYMBOL_SIZE + KIND_SIZE + 32];
+        if (symbol[0] != '\0' && kind[0] != '\0')
+            (void) snprintf(detail, sizeof(detail),
+                            "  \x1b[33m%s\x1b[0m \x1b[2m%s\x1b[0m", symbol, kind);
+        else if (symbol[0] != '\0')
+            (void) snprintf(detail, sizeof(detail), "  \x1b[33m%s\x1b[0m", symbol);
         else
-            (void) printf("\x1b[2K    \x1b[2m%s\x1b[0m\r\n", label);
+            detail[0] = '\0';
+
+        if (index == highlight)
+            (void) printf("\x1b[2K  \x1b[36m\xe2\x9d\xaf\x1b[0m \x1b[1m%s\x1b[0m%s\r\n",
+                          label, detail);
+        else
+            (void) printf("\x1b[2K    \x1b[2m%s\x1b[0m%s\r\n", label, detail);
 
         height++;
     }
@@ -452,12 +566,21 @@ static void list_pages(const char* section, const char* query, struct MatchList*
             char path[4096];
             (void) snprintf(path, sizeof(path), "%s/%s", section, entry->d_name);
 
-            long score = page_score(path, query) * section_weight(section);
+            struct Finding finding = {0};
+            page_find(path, query, &finding);
+
+            long score = finding.score * section_weight(section);
             if (filename_matches(entry->d_name, query))
+            {
                 score += WEIGHT_FILENAME;
+                if (finding.symbol[0] == '\0')
+                    (void) snprintf(finding.symbol, sizeof(finding.symbol), "%s",
+                                    query);
+            }
 
             if (score > 0)
-                (void) match_list_add(matches, path, score);
+                (void) match_list_add(matches, path, score, finding.symbol,
+                                      finding.kind);
         }
 
     (void) closedir(section_stream);
@@ -609,7 +732,17 @@ int main(int argc, char** argv)
     else
     {
         for (size_t index = 0; index < matches.count; index++)
-            (void) printf("%zu) %s\n", index + 1, matches.items[index].path);
+        {
+            char label[256];
+            page_label(matches.items[index].path, label, sizeof(label));
+
+            const char* symbol = matches.items[index].symbol;
+            const char* kind = matches.items[index].kind;
+            if (symbol[0] != '\0')
+                (void) printf("%zu) %s  %s (%s)\n", index + 1, label, symbol, kind);
+            else
+                (void) printf("%zu) %s\n", index + 1, label);
+        }
         has_selection = read_selection(matches.count, &selected);
     }
 
