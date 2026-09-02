@@ -1,0 +1,132 @@
+.TH JAFM 1 2026-09-03 "jafm 0.1.0" "General Commands Manual"
+.SH NAME
+jafm \- just a fucking manual: find a symbol across every man page and open it
+.SH SYNOPSIS
+.B jafm
+.RB [ \-1 ]
+.RB [ \-l ]
+.RB [ \-e ]
+.RB [ \-t
+.IR type ]
+.RB [ \-j
+.IR threads ]
+.I symbol
+.br
+.B jafm
+.RB [ \-v | \-h ]
+.SH DESCRIPTION
+.B jafm
+greps every man page in your
+.B manpath
+for
+.IR symbol ,
+ranks the hits so the page that actually documents it floats to the top, and
+drops you into an interactive picker with a live preview. Pick one and it opens
+in
+.BR man (1).
+.PP
+It exists because
+.B "man <symbol>"
+gives up the moment the thing you want lives inside some other page.
+.BR sockaddr_in ,
+for example, is documented inside
+.BR inet (4).
+jafm just reads all of them and finds it.
+.PP
+When standard input is not a terminal (say, a pipe), jafm skips the interactive
+UI: it prints the numbered matches and reads a selection number from stdin.
+.SH OPTIONS
+.TP
+.BR \-1 ", " \-\-first
+Open the best (top\-ranked) match immediately, without the picker.
+.TP
+.BR \-l ", " \-\-list
+Print the matches and exit. Opens nothing.
+.TP
+.BR \-e ", " \-\-exact
+Match
+.I symbol
+as a whole word only, so
+.B sockaddr
+no longer drags in
+.BR sockaddr_in .
+.TP
+.BR \-t ", " \-\-type " " \fIkind\fR
+Only show pages where the symbol appears as
+.IR kind :
+one of
+.BR struct ", " union ", " enum ", " typedef ", or " function .
+.TP
+.BR \-j ", " \-\-jobs " " \fIn\fR
+Scan with
+.I n
+worker threads (default 8, capped at 64).
+.TP
+.BR \-v ", " \-\-version
+Print version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.SH KEYS
+Inside the picker:
+.TP
+.BR \(ua ", " \(da ", " k ", " j
+Move the selection.
+.TP
+.B Enter
+Open the highlighted page in
+.BR man (1).
+.TP
+.BR q ", Ctrl-C"
+Quit without opening anything.
+.SH RANKING
+Matches are scored by where the symbol shows up, best first: its filename, then
+the NAME section, then a type definition
+.RB ( "struct ... {" ),
+then the SYNOPSIS, then anywhere in the body. Pages in the core sections
+(headers and sections 2, 4, 5, 7, 9) are weighted above library and command
+pages, and a page found under several man roots is collapsed to one entry.
+.SH COMPRESSION
+Plain and
+.B gzip
+pages are read directly;
+.BR zstd ", " xz ", and " bzip2
+pages are read through the matching decompressor if it is installed, which
+it will be on any system that stores its pages that way.
+.SH EXAMPLES
+.nf
+.RS
+# find the page that documents sockaddr, pick from a list
+jafm sockaddr
+
+# skip the picker, open the best match
+jafm -1 getentropy
+
+# only structs, printed rather than opened
+jafm -t struct -l sockaddr
+
+# whole word, open the winner
+jafm -e -1 inet
+.RE
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+A page was opened, or
+.B \-l
+listed matches.
+.TP
+.B 1
+Bad usage, no matches, or nothing was selected.
+.SH ENVIRONMENT
+.TP
+.B MANPATH
+Honored via
+.BR manpath (1),
+which jafm runs to find where your pages live.
+.SH SEE ALSO
+.BR man (1),
+.BR manpath (1),
+.BR apropos (1)
+.SH AUTHOR
+hachem <im@hachem.wtf>

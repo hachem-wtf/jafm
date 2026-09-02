@@ -35,7 +35,9 @@ TARGET := jafm
 SRC := jafm.c
 
 PREFIX ?= /usr/local
+MANPREFIX ?= $(PREFIX)/share/man
 BINDIR := $(DESTDIR)$(PREFIX)/bin
+MANDIR := $(DESTDIR)$(MANPREFIX)/man1
 
 all: $(TARGET)
 
@@ -52,9 +54,12 @@ check:
 install: $(TARGET)
 	install -d $(BINDIR)
 	install -m 755 $(TARGET) $(BINDIR)/$(TARGET)
+	install -d $(MANDIR)
+	install -m 644 $(TARGET).1 $(MANDIR)/$(TARGET).1
 
 uninstall:
 	rm -f $(BINDIR)/$(TARGET)
+	rm -f $(MANDIR)/$(TARGET).1
 
 clean:
 	rm -rf $(TARGET) $(TARGET).dSYM
