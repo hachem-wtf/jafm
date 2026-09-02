@@ -122,7 +122,32 @@ static bool is_definition_line(const char* line)
            || strstr(line, "enum") != NULL || strstr(line, "typedef") != NULL;
 }
 
-static long count_occurrences(const char* line, const char* query)
+static bool is_identifier_char(char character)
+{
+    return isalnum((unsigned char) character) || character == '_';
+}
+
+static bool is_whole_word(const char* line, const char* found, size_t query_length)
+{
+    if (found != line && is_identifier_char(found[-1]))
+        return false;
+
+    return !is_identifier_char(found[query_length]);
+}
+
+static const char* find_query(const char* line, const char* query,
+                              size_t query_length, bool exact)
+{
+    for (const char* cursor = strstr(line, query);
+         cursor != NULL;
+         cursor = strstr(cursor + query_length, query))
+        if (!exact || is_whole_word(line, cursor, query_length))
+            return cursor;
+
+    return NULL;
+}
+
+static long count_occurrences(const char* line, const char* query, bool exact)
 {
     size_t query_length = strlen(query);
     if (query_length == 0)
@@ -132,20 +157,16 @@ static long count_occurrences(const char* line, const char* query)
     for (const char* cursor = strstr(line, query);
          cursor != NULL;
          cursor = strstr(cursor + query_length, query))
-        count++;
+        if (!exact || is_whole_word(line, cursor, query_length))
+            count++;
 
     return count;
 }
 
-static bool is_identifier_char(char character)
+static void extract_symbol(const char* line, const char* query, bool exact,
+                           char* symbol, size_t symbol_size)
 {
-    return isalnum((unsigned char) character) || character == '_';
-}
-
-static void extract_symbol(const char* line, const char* query, char* symbol,
-                           size_t symbol_size)
-{
-    const char* found = strstr(line, query);
+    const char* found = find_query(line, query, strlen(query), exact);
     if (found == NULL)
         return;
 
@@ -207,6 +228,7 @@ struct Scan
     int best_tier;
     char symbol[SYMBOL_SIZE];
     char kind[KIND_SIZE];
+    bool exact;
     const char* want_kind;
     bool has_wanted;
     int best_wanted_tier;
@@ -229,7 +251,7 @@ static void scan_line(struct Scan* scan, const char* line, const char* query)
         return;
     }
 
-    long hits = count_occurrences(line, query);
+    long hits = count_occurrences(line, query, scan->exact);
     if (hits == 0)
         return;
 
@@ -258,7 +280,7 @@ static void scan_line(struct Scan* scan, const char* line, const char* query)
     if (tier > scan->best_tier)
     {
         scan->best_tier = tier;
-        extract_symbol(line, query, scan->symbol, sizeof(scan->symbol));
+        extract_symbol(line, query, scan->exact, scan->symbol, sizeof(scan->symbol));
         classify_kind(line, scan->symbol, scan->kind, sizeof(scan->kind));
     }
 
@@ -266,7 +288,7 @@ static void scan_line(struct Scan* scan, const char* line, const char* query)
     {
         char symbol[SYMBOL_SIZE];
         char kind[KIND_SIZE];
-        extract_symbol(line, query, symbol, sizeof(symbol));
+        extract_symbol(line, query, scan->exact, symbol, sizeof(symbol));
         classify_kind(line, symbol, kind, sizeof(kind));
 
         if (strcmp(kind, scan->want_kind) == 0)
@@ -381,14 +403,15 @@ static void scan_buffer(char* buffer, const char* query, struct Scan* scan)
     }
 }
 
-static void page_find(const char* path, const char* query, const char* want_kind,
-                      struct Finding* finding)
+static void page_find(const char* path, const char* query, bool exact,
+                      const char* want_kind, struct Finding* finding)
 {
     char* buffer = ends_with(path, ".gz") ? read_gzip(path) : read_plain(path);
     if (buffer == NULL)
         return;
 
     struct Scan scan = {0};
+    scan.exact = exact;
     scan.want_kind = want_kind;
     scan_buffer(buffer, query, &scan);
     free(buffer);
@@ -751,12 +774,12 @@ static void collect_sections(const char* directory, struct TaskList* tasks)
     (void) closedir(directory_stream);
 }
 
-static void scan_task(const struct Task* task, const char* query,
+static void scan_task(const struct Task* task, const char* query, bool exact,
                       const char* want_kind, struct MatchList* matches)
 {
     const char* path = task->path;
     struct Finding finding = {0};
-    page_find(path, query, want_kind, &finding);
+    page_find(path, query, exact, want_kind, &finding);
 
     if (want_kind != NULL && finding.score == 0)
         return;
@@ -782,6 +805,7 @@ struct Worker
     size_t start;
     size_t end;
     const char* query;
+    bool exact;
     const char* want_kind;
     struct MatchList matches;
 };
@@ -790,8 +814,8 @@ static void* worker_main(void* argument)
 {
     struct Worker* worker = argument;
     for (size_t index = worker->start; index < worker->end; index++)
-        scan_task(&worker->tasks[index], worker->query, worker->want_kind,
-                  &worker->matches);
+        scan_task(&worker->tasks[index], worker->query, worker->exact,
+                  worker->want_kind, &worker->matches);
 
     return NULL;
 }
@@ -807,7 +831,7 @@ static size_t worker_count(size_t task_count, size_t requested)
     return count == 0 ? 1 : count;
 }
 
-static void scan_tasks(const struct TaskList* tasks, const char* query,
+static void scan_tasks(const struct TaskList* tasks, const char* query, bool exact,
                        const char* want_kind, struct MatchList* matches,
                        size_t requested)
 {
@@ -832,6 +856,7 @@ static void scan_tasks(const struct TaskList* tasks, const char* query,
         workers[index].start = offset;
         workers[index].end = offset + chunk;
         workers[index].query = query;
+        workers[index].exact = exact;
         workers[index].want_kind = want_kind;
         offset += chunk;
         (void) pthread_create(&handles[index], NULL, worker_main, &workers[index]);
@@ -940,7 +965,8 @@ static bool is_valid_kind(const char* kind)
 
 static void print_usage(FILE* stream, const char* program)
 {
-    (void) fprintf(stream, "usage: %s [-1] [-l] [-t type] [-j threads] <symbol>\n",
+    (void) fprintf(stream,
+                   "usage: %s [-1] [-l] [-e] [-t type] [-j threads] <symbol>\n",
                    program);
     (void) fprintf(stream, "       %s [-v | -h]\n", program);
 }
@@ -954,6 +980,7 @@ static void print_help(const char* program)
     (void) printf("\noptions:\n"
                   "  -1, --first      open the best match without asking\n"
                   "  -l, --list       just print what it found, open nothing\n"
+                  "  -e, --exact      match the symbol as a whole word only\n"
                   "  -t, --type KIND  only show matches where the symbol is a KIND\n"
                   "                   (struct, union, enum, typedef, function)\n"
                   "  -j, --jobs N     scan with N worker threads (default %d)\n"
@@ -989,6 +1016,7 @@ int main(int argc, char** argv)
     {
         { "first",   no_argument,       NULL, '1'},
         { "list",    no_argument,       NULL, 'l'},
+        { "exact",   no_argument,       NULL, 'e'},
         { "type",    required_argument, NULL, 't'},
         { "jobs",    required_argument, NULL, 'j'},
         { "version", no_argument,       NULL, 'v'},
@@ -999,11 +1027,12 @@ int main(int argc, char** argv)
     size_t requested_threads = 0;
     bool open_first = false;
     bool list_only = false;
+    bool exact = false;
     const char* want_kind = NULL;
 
-    for (int option = getopt_long(argc, argv, "1lt:j:vh", long_options, NULL);
+    for (int option = getopt_long(argc, argv, "1let:j:vh", long_options, NULL);
          option != -1;
-         option = getopt_long(argc, argv, "1lt:j:vh", long_options, NULL))
+         option = getopt_long(argc, argv, "1let:j:vh", long_options, NULL))
         switch (option)
         {
             case '1':
@@ -1011,6 +1040,9 @@ int main(int argc, char** argv)
                 break;
             case 'l':
                 list_only = true;
+                break;
+            case 'e':
+                exact = true;
                 break;
             case 't':
                 if (!is_valid_kind(optarg))
@@ -1082,7 +1114,7 @@ int main(int argc, char** argv)
         collect_sections(directory, &tasks);
 
     struct MatchList matches = {0};
-    scan_tasks(&tasks, query, want_kind, &matches, requested_threads);
+    scan_tasks(&tasks, query, exact, want_kind, &matches, requested_threads);
     task_list_free(&tasks);
 
     if (matches.count == 0)
