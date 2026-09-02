@@ -38,6 +38,16 @@
 #define WEIGHT_SYNOPSIS   50
 #define WEIGHT_BODY       1
 
+#define C_RESET  "\x1b[0m"
+#define C_DIM    "\x1b[2m"
+#define C_BOLD   "\x1b[1m"
+#define C_KEY    "\x1b[36m"
+#define C_TITLE  "\x1b[1;36m"
+#define C_NAME   "\x1b[1;36m"
+#define C_SYMBOL "\x1b[33m"
+#define C_MATCH  "\x1b[1;33m"
+#define C_COUNT  "\x1b[32m"
+
 struct Match
 {
     char* path;
@@ -126,6 +136,17 @@ static bool ends_with(const char* string, const char* suffix)
         return false;
 
     return strcmp(string + string_length - suffix_length, suffix) == 0;
+}
+
+static void strip_compression_suffix(char* name)
+{
+    static const char* suffixes[] = {".gz", ".zst", ".xz", ".bz2"};
+    for (size_t index = 0; index < sizeof(suffixes) / sizeof(suffixes[0]); index++)
+        if (ends_with(name, suffixes[index]))
+        {
+            name[strlen(name) - strlen(suffixes[index])] = '\0';
+            return;
+        }
 }
 
 static bool is_section_header(const char* line)
@@ -269,6 +290,13 @@ struct Finding
     char kind[KIND_SIZE];
 };
 
+struct Search
+{
+    const char* query;
+    bool exact;
+    const char* want_kind;
+};
+
 static void scan_line(struct Scan* scan, const char* line, const char* query)
 {
     if (is_section_header(line))
@@ -334,24 +362,17 @@ static long scan_score(const struct Scan* scan)
            + scan->synopsis_hits * WEIGHT_SYNOPSIS + scan->body_hits * WEIGHT_BODY;
 }
 
-static char* read_plain(const char* path)
+static char* read_stream(FILE* stream)
 {
-    FILE* page = fopen(path, "rb");
-    if (page == NULL)
-        return NULL;
-
     size_t capacity = 65536;
     size_t length = 0;
     char* buffer = malloc(capacity);
     if (buffer == NULL)
-    {
-        (void) fclose(page);
         return NULL;
-    }
 
     for (;;)
     {
-        size_t got = fread(buffer + length, 1, capacity - length - 1, page);
+        size_t got = fread(buffer + length, 1, capacity - length - 1, stream);
         length += got;
         if (length + 1 < capacity)
             break;
@@ -361,14 +382,38 @@ static char* read_plain(const char* path)
         if (grown == NULL)
         {
             free(buffer);
-            (void) fclose(page);
             return NULL;
         }
         buffer = grown;
     }
 
-    (void) fclose(page);
     buffer[length] = '\0';
+    return buffer;
+}
+
+static char* read_plain(const char* path)
+{
+    FILE* page = fopen(path, "rb");
+    if (page == NULL)
+        return NULL;
+
+    char* buffer = read_stream(page);
+    (void) fclose(page);
+    return buffer;
+}
+
+static char* read_command(const char* tool, const char* path)
+{
+    char command[8192];
+    (void) snprintf(command, sizeof(command), "%s -dc -- '%s' 2>/dev/null", tool,
+                    path);
+
+    FILE* pipe = popen(command, "r");
+    if (pipe == NULL)
+        return NULL;
+
+    char* buffer = read_stream(pipe);
+    (void) pclose(pipe);
     return buffer;
 }
 
@@ -413,6 +458,20 @@ static char* read_gzip(const char* path)
     return buffer;
 }
 
+static char* read_page(const char* path)
+{
+    if (ends_with(path, ".gz"))
+        return read_gzip(path);
+    if (ends_with(path, ".zst"))
+        return read_command("zstd", path);
+    if (ends_with(path, ".xz"))
+        return read_command("xz", path);
+    if (ends_with(path, ".bz2"))
+        return read_command("bzip2", path);
+
+    return read_plain(path);
+}
+
 static void scan_buffer(char* buffer, const char* query, struct Scan* scan)
 {
     if (strstr(buffer, query) == NULL)
@@ -430,20 +489,20 @@ static void scan_buffer(char* buffer, const char* query, struct Scan* scan)
     }
 }
 
-static void page_find(const char* path, const char* query, bool exact,
-                      const char* want_kind, struct Finding* finding)
+static void page_find(const char* path, const struct Search* search,
+                      struct Finding* finding)
 {
-    char* buffer = ends_with(path, ".gz") ? read_gzip(path) : read_plain(path);
+    char* buffer = read_page(path);
     if (buffer == NULL)
         return;
 
     struct Scan scan = {0};
-    scan.exact = exact;
-    scan.want_kind = want_kind;
-    scan_buffer(buffer, query, &scan);
+    scan.exact = search->exact;
+    scan.want_kind = search->want_kind;
+    scan_buffer(buffer, search->query, &scan);
     free(buffer);
 
-    if (want_kind != NULL)
+    if (search->want_kind != NULL)
     {
         if (!scan.has_wanted)
             return;
@@ -451,7 +510,8 @@ static void page_find(const char* path, const char* query, bool exact,
         finding->score = scan_score(&scan);
         (void) snprintf(finding->symbol, sizeof(finding->symbol), "%s",
                         scan.wanted_symbol);
-        (void) snprintf(finding->kind, sizeof(finding->kind), "%s", want_kind);
+        (void) snprintf(finding->kind, sizeof(finding->kind), "%s",
+                        search->want_kind);
         return;
     }
 
@@ -486,9 +546,7 @@ static bool filename_matches(const char* name, const char* query)
     char base[256];
     (void) snprintf(base, sizeof(base), "%s", name);
 
-    size_t length = strlen(base);
-    if (length > 3 && strcmp(base + length - 3, ".gz") == 0)
-        base[length - 3] = '\0';
+    strip_compression_suffix(base);
 
     char* section_dot = strrchr(base, '.');
     if (section_dot != NULL)
@@ -569,9 +627,7 @@ static void page_label(const char* path, char* label, size_t label_size)
     char base[256];
     (void) snprintf(base, sizeof(base), "%s", name);
 
-    size_t length = strlen(base);
-    if (length > 3 && strcmp(base + length - 3, ".gz") == 0)
-        base[length - 3] = '\0';
+    strip_compression_suffix(base);
 
     char* section_dot = strrchr(base, '.');
     if (section_dot != NULL)
@@ -650,18 +706,18 @@ static size_t print_list_cell(const struct Match* item, bool selected, size_t bu
     char label[256];
     page_label(item->path, label, sizeof(label));
 
-    size_t used = print_segment(label, selected ? "\x1b[1m" : "\x1b[2m", budget);
+    size_t used = print_segment(label, selected ? C_BOLD : C_DIM, budget);
 
     if (item->symbol[0] != '\0')
     {
         used += print_segment("  ", "", budget - used);
-        used += print_segment(item->symbol, "\x1b[33m", budget - used);
+        used += print_segment(item->symbol, C_SYMBOL, budget - used);
 
         if (item->kind[0] != '\0')
         {
             char kind[KIND_SIZE + 3];
             (void) snprintf(kind, sizeof(kind), " (%s)", item->kind);
-            used += print_segment(kind, "\x1b[2m", budget - used);
+            used += print_segment(kind, C_DIM, budget - used);
         }
     }
 
@@ -682,11 +738,140 @@ static void print_highlighted(const char* text, const char* query)
          hit = strstr(cursor, query))
     {
         (void) printf("%.*s", (int) (hit - cursor), cursor);
-        (void) printf("\x1b[1;33m%.*s\x1b[0m", (int) query_length, hit);
+        (void) printf(C_MATCH "%.*s" C_RESET, (int) query_length, hit);
         cursor = hit + query_length;
     }
 
     (void) printf("%s", cursor);
+}
+
+struct Layout
+{
+    bool panel;
+    size_t usable;
+    size_t left_width;
+    size_t right_width;
+};
+
+static size_t list_column_width(const struct MatchList* matches)
+{
+    size_t widest = LIST_WIDTH;
+    for (size_t index = 0; index < matches->count; index++)
+    {
+        char label[256];
+        page_label(matches->items[index].path, label, sizeof(label));
+
+        const char* symbol = matches->items[index].symbol;
+        const char* kind = matches->items[index].kind;
+
+        size_t entry = strlen(label) + 2;
+        if (symbol[0] != '\0')
+        {
+            entry += 2 + strlen(symbol);
+            if (kind[0] != '\0')
+                entry += 3 + strlen(kind);
+        }
+
+        if (entry > widest)
+            widest = entry;
+    }
+
+    return widest;
+}
+
+static struct Layout compute_layout(const struct MatchList* matches, size_t cols)
+{
+    size_t indent = 2;
+    size_t usable = cols > indent + 1 ? cols - indent - 1 : 0;
+
+    struct Layout layout = {false, usable, usable, 0};
+    if (usable < PANEL_MIN_WIDTH)
+        return layout;
+
+    size_t separator = 3;
+    size_t minimum_preview = 24;
+    size_t cap = usable - minimum_preview - separator;
+    size_t widest = list_column_width(matches);
+
+    layout.panel = true;
+    layout.left_width = widest < cap ? widest : cap;
+    layout.right_width = usable - layout.left_width - separator;
+    return layout;
+}
+
+static void render_row(const struct MatchList* matches, size_t list_index,
+                       size_t highlight, size_t end, const struct Layout* layout,
+                       const struct Match* current, size_t row, const char* query)
+{
+    (void) printf("\x1b[2K  ");
+
+    if (list_index < end)
+    {
+        bool selected = list_index == highlight;
+        if (selected)
+            (void) printf(C_KEY "\xe2\x9d\xaf" C_RESET " ");
+        else
+            (void) printf("  ");
+
+        size_t budget = layout->left_width > 2 ? layout->left_width - 2 : 0;
+        size_t used = print_list_cell(&matches->items[list_index], selected, budget);
+
+        if (layout->panel)
+            for (size_t pad = used + 2; pad < layout->left_width; pad++)
+                (void) putchar(' ');
+    }
+    else if (layout->panel)
+        for (size_t pad = 0; pad < layout->left_width; pad++)
+            (void) putchar(' ');
+
+    if (layout->panel)
+    {
+        (void) printf(C_DIM " \xe2\x94\x82" C_RESET " ");
+
+        size_t preview_index = current->preview_start + row;
+        if (current->preview_loaded && preview_index < current->preview_count)
+        {
+            char cell[1024];
+            (void) fit(cell, sizeof(cell), current->preview[preview_index],
+                       layout->right_width);
+            print_highlighted(cell, query);
+        }
+    }
+
+    (void) printf("\r\n");
+}
+
+static void render_footer(const struct Match* current, size_t highlight,
+                          size_t count, size_t usable)
+{
+    (void) printf("\x1b[2K  ");
+    const char* path = current->path;
+    const char* slash = strrchr(path, '/');
+    if (slash != NULL)
+    {
+        char directory[1024];
+        (void) snprintf(directory, sizeof(directory), "%.*s",
+                        (int) (slash - path + 1), path);
+        size_t used = print_segment(directory, C_DIM, usable);
+        (void) print_segment(slash + 1, C_NAME, usable - used);
+    }
+    else
+        (void) print_segment(path, C_NAME, usable);
+    (void) printf("\r\n");
+
+    (void) printf("\x1b[2K  ");
+    size_t used = 0;
+    used += print_segment("up/down", C_KEY, usable - used);
+    used += print_segment(" move  ", C_DIM, usable - used);
+    used += print_segment("enter", C_KEY, usable - used);
+    used += print_segment(" open  ", C_DIM, usable - used);
+    used += print_segment("q", C_KEY, usable - used);
+    used += print_segment(" quit  ", C_DIM, usable - used);
+
+    char counter[32];
+    (void) snprintf(counter, sizeof(counter), "[%zu/%zu]", highlight + 1, count);
+    (void) print_segment(counter, C_COUNT, usable - used);
+    (void) printf("\r\n");
 }
 
 static size_t render_menu(const struct MatchList* matches, size_t highlight,
@@ -696,27 +881,12 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
     if (previous_height > 0)
         (void) printf("\x1b[%zuA", previous_height);
 
-    size_t indent = 2;
-    size_t usable = cols > indent + 1 ? cols - indent - 1 : 0;
-    bool panel = usable >= PANEL_MIN_WIDTH;
-    size_t separator = 3;
-
-    size_t left_width = usable;
-    if (panel)
-    {
-        left_width = usable * 2 / 5;
-        if (left_width < LIST_WIDTH)
-            left_width = LIST_WIDTH;
-        if (left_width > 64)
-            left_width = 64;
-    }
-    size_t right_width = panel ? usable - left_width - separator : 0;
-
+    struct Layout layout = compute_layout(matches, cols);
     const struct Match* current = &matches->items[highlight];
     size_t height = 0;
 
-    (void) printf("\r\x1b[2K  \x1b[1;36mjafm\x1b[0m \x1b[2m%zu matches\x1b[0m\r\n",
-                  matches->count);
+    (void) printf("\r\x1b[2K  " C_TITLE "jafm" C_RESET " " C_DIM "%zu matches" C_RESET
+                  "\r\n", matches->count);
     height++;
 
     (void) printf("\x1b[2K\r\n");
@@ -728,81 +898,15 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
 
     for (size_t row = 0; row < visible; row++)
     {
-        (void) printf("\x1b[2K  ");
-
-        size_t list_index = top + row;
-        if (list_index < end)
-        {
-            bool selected = list_index == highlight;
-
-            if (selected)
-                (void) printf("\x1b[36m\xe2\x9d\xaf\x1b[0m ");
-            else
-                (void) printf("  ");
-
-            size_t budget = left_width > 2 ? left_width - 2 : 0;
-            size_t used = print_list_cell(&matches->items[list_index], selected,
-                                          budget);
-
-            if (panel)
-                for (size_t pad = used + 2; pad < left_width; pad++)
-                    (void) putchar(' ');
-        }
-        else if (panel)
-            for (size_t pad = 0; pad < left_width; pad++)
-                (void) putchar(' ');
-
-        if (panel)
-        {
-            (void) printf("\x1b[2m \xe2\x94\x82\x1b[0m ");
-
-            size_t preview_index = current->preview_start + row;
-            if (current->preview_loaded && preview_index < current->preview_count)
-            {
-                char cell[1024];
-                (void) fit(cell, sizeof(cell), current->preview[preview_index],
-                           right_width);
-                print_highlighted(cell, query);
-            }
-        }
-
-        (void) printf("\r\n");
+        render_row(matches, top + row, highlight, end, &layout, current, row, query);
         height++;
     }
 
     (void) printf("\x1b[2K\r\n");
     height++;
 
-    (void) printf("\x1b[2K  ");
-    const char* path = current->path;
-    const char* slash = strrchr(path, '/');
-    if (slash != NULL)
-    {
-        char directory[1024];
-        (void) snprintf(directory, sizeof(directory), "%.*s",
-                        (int) (slash - path + 1), path);
-        size_t used = print_segment(directory, "\x1b[2m", usable);
-        (void) print_segment(slash + 1, "\x1b[1;36m", usable - used);
-    }
-    else
-        (void) print_segment(path, "\x1b[1;36m", usable);
-    (void) printf("\r\n");
-    height++;
-
-    (void) printf("\x1b[2K  ");
-    size_t used = 0;
-    used += print_segment("up/down", "\x1b[36m", usable - used);
-    used += print_segment(" move  ", "\x1b[2m", usable - used);
-    used += print_segment("enter", "\x1b[36m", usable - used);
-    used += print_segment(" open  ", "\x1b[2m", usable - used);
-    used += print_segment("q", "\x1b[36m", usable - used);
-    used += print_segment(" quit  ", "\x1b[2m", usable - used);
-    char counter[32];
-    (void) snprintf(counter, sizeof(counter), "[%zu/%zu]", highlight + 1,
-                    matches->count);
-    (void) print_segment(counter, "\x1b[32m", usable - used);
-    (void) printf("\r\n");
-    height++;
+    render_footer(current, highlight, matches->count, layout.usable);
+    height += 2;
 
     (void) printf("\x1b[J");
     return height;
@@ -991,25 +1095,26 @@ static void collect_sections(const char* directory, struct TaskList* tasks)
     (void) closedir(directory_stream);
 }
 
-static void scan_task(const struct Task* task, const char* query, bool exact,
-                      const char* want_kind, struct MatchList* matches)
+static void scan_task(const struct Task* task, const struct Search* search,
+                      struct MatchList* matches)
 {
     const char* path = task->path;
     struct Finding finding = {0};
-    page_find(path, query, exact, want_kind, &finding);
+    page_find(path, search, &finding);
 
-    if (want_kind != NULL && finding.score == 0)
+    if (search->want_kind != NULL && finding.score == 0)
         return;
 
     long score = finding.score * task->weight;
 
     const char* base = strrchr(path, '/');
     base = base != NULL ? base + 1 : path;
-    if (filename_matches(base, query))
+    if (filename_matches(base, search->query))
     {
         score += WEIGHT_FILENAME;
         if (finding.symbol[0] == '\0')
-            (void) snprintf(finding.symbol, sizeof(finding.symbol), "%s", query);
+            (void) snprintf(finding.symbol, sizeof(finding.symbol), "%s",
+                            search->query);
     }
 
     if (score > 0)
@@ -1021,9 +1126,7 @@ struct Worker
     const struct Task* tasks;
     size_t start;
     size_t end;
-    const char* query;
-    bool exact;
-    const char* want_kind;
+    const struct Search* search;
     struct MatchList matches;
 };
 
@@ -1031,8 +1134,7 @@ static void* worker_main(void* argument)
 {
     struct Worker* worker = argument;
     for (size_t index = worker->start; index < worker->end; index++)
-        scan_task(&worker->tasks[index], worker->query, worker->exact,
-                  worker->want_kind, &worker->matches);
+        scan_task(&worker->tasks[index], worker->search, &worker->matches);
 
     return NULL;
 }
@@ -1048,9 +1150,8 @@ static size_t worker_count(size_t task_count, size_t requested)
     return count == 0 ? 1 : count;
 }
 
-static void scan_tasks(const struct TaskList* tasks, const char* query, bool exact,
-                       const char* want_kind, struct MatchList* matches,
-                       size_t requested)
+static void scan_tasks(const struct TaskList* tasks, const struct Search* search,
+                       struct MatchList* matches, size_t requested)
 {
     size_t threads = worker_count(tasks->count, requested);
 
@@ -1072,9 +1173,7 @@ static void scan_tasks(const struct TaskList* tasks, const char* query, bool exa
         workers[index].tasks = tasks->items;
         workers[index].start = offset;
         workers[index].end = offset + chunk;
-        workers[index].query = query;
-        workers[index].exact = exact;
-        workers[index].want_kind = want_kind;
+        workers[index].search = search;
         offset += chunk;
         (void) pthread_create(&handles[index], NULL, worker_main, &workers[index]);
     }
@@ -1141,9 +1240,7 @@ static bool page_man_args(const char* path, char* root, size_t root_size,
     char work[4096];
     (void) snprintf(work, sizeof(work), "%s", path);
 
-    size_t length = strlen(work);
-    if (length > 3 && strcmp(work + length - 3, ".gz") == 0)
-        work[length - 3] = '\0';
+    strip_compression_suffix(work);
 
     char* name_slash = strrchr(work, '/');
     if (name_slash == NULL)
@@ -1404,8 +1501,9 @@ int main(int argc, char** argv)
          directory = strtok_r(NULL, ":", &save_pointer))
         collect_sections(directory, &tasks);
 
+    struct Search search = {query, exact, want_kind};
     struct MatchList matches = {0};
-    scan_tasks(&tasks, query, exact, want_kind, &matches, requested_threads);
+    scan_tasks(&tasks, &search, &matches, requested_threads);
     task_list_free(&tasks);
 
     if (matches.count == 0)
