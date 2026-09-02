@@ -1,8 +1,10 @@
-bin/
+jafm
+*.dSYM/
 
 compile_commands.json
 compile_flags.txt
 .clangd
+.cache/
 
 .DS_Store
 

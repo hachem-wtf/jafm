@@ -11,8 +11,7 @@ CFLAGS := -Wall \
           -g \
           -fno-omit-frame-pointer \
           -fsanitize=address,undefined \
-          -std=c17 \
-          -Isrc
+          -std=c17
 
 LDFLAGS := -fsanitize=address,undefined \
            -lz
@@ -21,26 +20,19 @@ CPPCHECKFLAGS := --project=compile_commands.json \
                  --enable=warning,style,performance,portability \
                  --error-exitcode=1
 
-TARGET := bin/jafm
-
-SRC := $(shell find src -name '*.c')
-OBJ := $(SRC:src/%.c=bin/%.o)
+TARGET := jafm
+SRC := jafm.c
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ)
-	@mkdir -p $(@D)
-	$(CC) $^ -o $@ $(LDFLAGS)
-
-bin/%.o: src/%.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS)
 
 check:
 	bear -- make clean all
 	cppcheck $(CPPCHECKFLAGS)
 
 clean:
-	rm -rf bin
+	rm -rf $(TARGET) $(TARGET).dSYM
 
 .PHONY: all check clean

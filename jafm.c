@@ -431,6 +431,42 @@ static void list_sections(const char* directory, const char* query, struct Match
     (void) closedir(directory_stream);
 }
 
+static int open_page(const char* path)
+{
+    char work[4096];
+    (void) snprintf(work, sizeof(work), "%s", path);
+
+    size_t length = strlen(work);
+    if (length > 3 && strcmp(work + length - 3, ".gz") == 0)
+        work[length - 3] = '\0';
+
+    char* name_slash = strrchr(work, '/');
+    if (name_slash == NULL)
+        return 1;
+
+    *name_slash = '\0';
+    char* name = name_slash + 1;
+
+    char* section_dot = strrchr(name, '.');
+    if (section_dot != NULL)
+        *section_dot = '\0';
+
+    char* root_slash = strrchr(work, '/');
+    if (root_slash == NULL)
+        return 1;
+
+    *root_slash = '\0';
+    char* root = work;
+    char* section = root_slash + 1;
+    if (strncmp(section, "man", 3) == 0)
+        section += 3;
+
+    (void) execlp("man", "man", "-M", root, section, name, (char*) NULL);
+
+    (void) fprintf(stderr, "jafm: failed to run man\n");
+    return 1;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2)
@@ -495,8 +531,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    (void) printf("selected: %s\n", matches.items[selected].path);
+    char chosen[4096];
+    (void) snprintf(chosen, sizeof(chosen), "%s", matches.items[selected].path);
 
     match_list_free(&matches);
-    return 0;
+    return open_page(chosen);
 }
