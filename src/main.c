@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <dirent.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #include <stdbool.h>
@@ -9,24 +12,40 @@
 #include <string.h>
 
 #define LINE_SIZE 8192
+#define MAX_VISIBLE 12
+
+enum Rank
+{
+    RANK_FILENAME,
+    RANK_NAME,
+    RANK_BODY,
+    RANK_NONE
+};
+
+struct Match
+{
+    char* path;
+    enum Rank rank;
+};
 
 struct MatchList
 {
-    char** paths;
+    struct Match* items;
     size_t count;
     size_t capacity;
 };
 
-static bool match_list_add(struct MatchList* matches, const char* path)
+static bool match_list_add(struct MatchList* matches, const char* path, enum Rank rank)
 {
     if (matches->count == matches->capacity)
     {
         size_t new_capacity = matches->capacity == 0 ? 16 : matches->capacity * 2;
-        char** grown = realloc(matches->paths, new_capacity * sizeof(char*));
+        struct Match* grown =
+            realloc(matches->items, new_capacity * sizeof(struct Match));
         if (grown == NULL)
             return false;
 
-        matches->paths = grown;
+        matches->items = grown;
         matches->capacity = new_capacity;
     }
 
@@ -34,7 +53,8 @@ static bool match_list_add(struct MatchList* matches, const char* path)
     if (copy == NULL)
         return false;
 
-    matches->paths[matches->count] = copy;
+    matches->items[matches->count].path = copy;
+    matches->items[matches->count].rank = rank;
     matches->count++;
     return true;
 }
@@ -42,9 +62,20 @@ static bool match_list_add(struct MatchList* matches, const char* path)
 static void match_list_free(struct MatchList* matches)
 {
     for (size_t index = 0; index < matches->count; index++)
-        free(matches->paths[index]);
+        free(matches->items[index].path);
 
-    free(matches->paths);
+    free(matches->items);
+}
+
+static int compare_matches(const void* left, const void* right)
+{
+    const struct Match* first = left;
+    const struct Match* second = right;
+
+    if (first->rank != second->rank)
+        return first->rank < second->rank ? -1 : 1;
+
+    return strcmp(first->path, second->path);
 }
 
 static bool ends_with(const char* string, const char* suffix)
@@ -58,50 +89,300 @@ static bool ends_with(const char* string, const char* suffix)
     return strcmp(string + string_length - suffix_length, suffix) == 0;
 }
 
-static bool plain_page_contains(const char* path, const char* query)
+static bool is_section_header(const char* line)
+{
+    return strncmp(line, ".SH", 3) == 0 || strncmp(line, ".Sh", 3) == 0;
+}
+
+static void classify_line(const char* line, const char* query, bool* in_name,
+                          bool* found_name, bool* found_body)
+{
+    if (is_section_header(line))
+        *in_name = strstr(line, "NAME") != NULL;
+
+    if (strstr(line, query) == NULL)
+        return;
+
+    *found_body = true;
+    if (*in_name || strncmp(line, ".Nm", 3) == 0)
+        *found_name = true;
+}
+
+static enum Rank rank_from(bool found_name, bool found_body)
+{
+    if (found_name)
+        return RANK_NAME;
+
+    if (found_body)
+        return RANK_BODY;
+
+    return RANK_NONE;
+}
+
+static enum Rank plain_page_rank(const char* path, const char* query)
 {
     FILE* page = fopen(path, "r");
     if (page == NULL)
-        return false;
+        return RANK_NONE;
 
     char line[LINE_SIZE];
-    bool found = false;
+    bool in_name = false;
+    bool found_name = false;
+    bool found_body = false;
     while (fgets(line, sizeof(line), page) != NULL)
-        if (strstr(line, query) != NULL)
-        {
-            found = true;
-            break;
-        }
+        classify_line(line, query, &in_name, &found_name, &found_body);
 
     (void) fclose(page);
-    return found;
+    return rank_from(found_name, found_body);
 }
 
-static bool gzip_page_contains(const char* path, const char* query)
+static enum Rank gzip_page_rank(const char* path, const char* query)
 {
     gzFile page = gzopen(path, "r");
     if (page == NULL)
-        return false;
+        return RANK_NONE;
 
     char line[LINE_SIZE];
-    bool found = false;
+    bool in_name = false;
+    bool found_name = false;
+    bool found_body = false;
     while (gzgets(page, line, LINE_SIZE) != NULL)
-        if (strstr(line, query) != NULL)
-        {
-            found = true;
-            break;
-        }
+        classify_line(line, query, &in_name, &found_name, &found_body);
 
     (void) gzclose(page);
-    return found;
+    return rank_from(found_name, found_body);
 }
 
-static bool page_contains(const char* path, const char* query)
+static enum Rank page_rank(const char* path, const char* query)
 {
     if (ends_with(path, ".gz"))
-        return gzip_page_contains(path, query);
+        return gzip_page_rank(path, query);
 
-    return plain_page_contains(path, query);
+    return plain_page_rank(path, query);
+}
+
+static bool filename_matches(const char* name, const char* query)
+{
+    char base[256];
+    (void) snprintf(base, sizeof(base), "%s", name);
+
+    size_t length = strlen(base);
+    if (length > 3 && strcmp(base + length - 3, ".gz") == 0)
+        base[length - 3] = '\0';
+
+    char* section_dot = strrchr(base, '.');
+    if (section_dot != NULL)
+        *section_dot = '\0';
+
+    return strcmp(base, query) == 0;
+}
+
+static struct termios original_termios;
+
+static void disable_raw_mode(void)
+{
+    (void) tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+}
+
+static bool enable_raw_mode(void)
+{
+    if (tcgetattr(STDIN_FILENO, &original_termios) == -1)
+        return false;
+
+    struct termios raw = original_termios;
+    raw.c_lflag &= ~(tcflag_t)(ECHO | ICANON | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
+        return false;
+
+    return true;
+}
+
+static void terminal_size(size_t* rows, size_t* cols)
+{
+    struct winsize window;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0 && window.ws_row > 0)
+    {
+        *rows = window.ws_row;
+        *cols = window.ws_col > 0 ? window.ws_col : 80;
+    }
+    else
+    {
+        *rows = 24;
+        *cols = 80;
+    }
+}
+
+static void page_label(const char* path, char* label, size_t label_size)
+{
+    const char* slash = strrchr(path, '/');
+    const char* name = slash != NULL ? slash + 1 : path;
+
+    char base[256];
+    (void) snprintf(base, sizeof(base), "%s", name);
+
+    size_t length = strlen(base);
+    if (length > 3 && strcmp(base + length - 3, ".gz") == 0)
+        base[length - 3] = '\0';
+
+    char* section_dot = strrchr(base, '.');
+    if (section_dot != NULL)
+    {
+        *section_dot = '\0';
+        (void) snprintf(label, label_size, "%s(%s)", base, section_dot + 1);
+    }
+    else
+        (void) snprintf(label, label_size, "%s", base);
+}
+
+static size_t render_menu(const struct MatchList* matches, size_t highlight,
+                          size_t top, size_t visible, size_t cols,
+                          size_t previous_height)
+{
+    if (previous_height > 0)
+        (void) printf("\x1b[%zuA", previous_height);
+
+    size_t height = 0;
+
+    (void) printf("\r\x1b[2K  \x1b[1;36mjafm\x1b[0m \x1b[2m%zu matches\x1b[0m\r\n",
+                  matches->count);
+    height++;
+
+    (void) printf("\x1b[2K\r\n");
+    height++;
+
+    size_t end = top + visible;
+    if (end > matches->count)
+        end = matches->count;
+
+    for (size_t index = top; index < end; index++)
+    {
+        char label[256];
+        page_label(matches->items[index].path, label, sizeof(label));
+
+        if (index == highlight)
+            (void) printf("\x1b[2K  \x1b[36m\xe2\x9d\xaf\x1b[0m \x1b[1m%s\x1b[0m\r\n",
+                          label);
+        else
+            (void) printf("\x1b[2K    \x1b[2m%s\x1b[0m\r\n", label);
+
+        height++;
+    }
+
+    const char* path = matches->items[highlight].path;
+    size_t path_length = strlen(path);
+    size_t budget = cols > 4 ? cols - 4 : 0;
+    bool truncated = path_length > budget;
+    const char* shown = truncated ? path + (path_length - budget + 1) : path;
+
+    (void) printf("\x1b[2K\r\n");
+    height++;
+
+    (void) printf("\x1b[2K  \x1b[2m%s%s\x1b[0m\r\n", truncated ? "\xe2\x80\xa6" : "", shown);
+    height++;
+
+    (void) printf("\x1b[2K  \x1b[2mup/down move  enter open  q quit  [%zu/%zu]\x1b[0m\r\n",
+                  highlight + 1, matches->count);
+    height++;
+
+    (void) printf("\x1b[J");
+    return height;
+}
+
+static bool select_interactive(const struct MatchList* matches, size_t* selected)
+{
+    if (!enable_raw_mode())
+        return false;
+
+    size_t highlight = 0;
+    size_t top = 0;
+    size_t previous_height = 0;
+    bool chosen = false;
+    bool done = false;
+
+    while (!done)
+    {
+        size_t rows = 0;
+        size_t cols = 0;
+        terminal_size(&rows, &cols);
+
+        size_t reserved = 5;
+        size_t visible = rows > reserved ? rows - reserved : 1;
+        if (visible > MAX_VISIBLE)
+            visible = MAX_VISIBLE;
+
+        if (highlight < top)
+            top = highlight;
+        else if (highlight >= top + visible)
+            top = highlight - visible + 1;
+
+        previous_height = render_menu(matches, highlight, top, visible, cols,
+                                      previous_height);
+
+        char key = 0;
+        if (read(STDIN_FILENO, &key, 1) != 1)
+            break;
+
+        if (key == '\r' || key == '\n')
+        {
+            chosen = true;
+            done = true;
+        }
+        else if (key == 'q' || key == 3)
+            done = true;
+        else if (key == 'j')
+        {
+            if (highlight + 1 < matches->count)
+                highlight++;
+        }
+        else if (key == 'k')
+        {
+            if (highlight > 0)
+                highlight--;
+        }
+        else if (key == '\x1b')
+        {
+            char sequence[2];
+            if (read(STDIN_FILENO, &sequence[0], 1) == 1
+                && read(STDIN_FILENO, &sequence[1], 1) == 1
+                && sequence[0] == '[')
+            {
+                if (sequence[1] == 'B' && highlight + 1 < matches->count)
+                    highlight++;
+                else if (sequence[1] == 'A' && highlight > 0)
+                    highlight--;
+            }
+        }
+    }
+
+    if (previous_height > 0)
+        (void) printf("\x1b[%zuA\r\x1b[J", previous_height);
+
+    disable_raw_mode();
+
+    if (chosen)
+        *selected = highlight;
+
+    return chosen;
+}
+
+static bool read_selection(size_t count, size_t* selected)
+{
+    (void) printf("select [1-%zu]: ", count);
+
+    char input[64];
+    if (fgets(input, sizeof(input), stdin) == NULL)
+        return false;
+
+    char* end = NULL;
+    long value = strtol(input, &end, 10);
+    if (end == input || value < 1 || (size_t) value > count)
+        return false;
+
+    *selected = (size_t) value - 1;
+    return true;
 }
 
 static void list_pages(const char* section, const char* query, struct MatchList* matches)
@@ -117,8 +398,15 @@ static void list_pages(const char* section, const char* query, struct MatchList*
         {
             char path[4096];
             (void) snprintf(path, sizeof(path), "%s/%s", section, entry->d_name);
-            if (page_contains(path, query))
-                (void) match_list_add(matches, path);
+
+            if (filename_matches(entry->d_name, query))
+                (void) match_list_add(matches, path, RANK_FILENAME);
+            else
+            {
+                enum Rank rank = page_rank(path, query);
+                if (rank != RANK_NONE)
+                    (void) match_list_add(matches, path, rank);
+            }
         }
 
     (void) closedir(section_stream);
@@ -180,8 +468,34 @@ int main(int argc, char** argv)
          directory = strtok_r(NULL, ":", &save_pointer))
         list_sections(directory, query, &matches);
 
-    for (size_t index = 0; index < matches.count; index++)
-        (void) printf("%zu) %s\n", index + 1, matches.paths[index]);
+    if (matches.count == 0)
+    {
+        (void) fprintf(stderr, "jafm: no matches for %s\n", query);
+        match_list_free(&matches);
+        return 1;
+    }
+
+    qsort(matches.items, matches.count, sizeof(struct Match), compare_matches);
+
+    size_t selected = 0;
+    bool has_selection;
+    if (isatty(STDIN_FILENO))
+        has_selection = select_interactive(&matches, &selected);
+    else
+    {
+        for (size_t index = 0; index < matches.count; index++)
+            (void) printf("%zu) %s\n", index + 1, matches.items[index].path);
+        has_selection = read_selection(matches.count, &selected);
+    }
+
+    if (!has_selection)
+    {
+        (void) fprintf(stderr, "jafm: no selection\n");
+        match_list_free(&matches);
+        return 1;
+    }
+
+    (void) printf("selected: %s\n", matches.items[selected].path);
 
     match_list_free(&matches);
     return 0;
