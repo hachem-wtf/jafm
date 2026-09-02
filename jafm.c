@@ -634,9 +634,30 @@ static size_t print_list_cell(const struct Match* item, bool selected, size_t bu
     return used;
 }
 
+static void print_highlighted(const char* text, const char* query)
+{
+    size_t query_length = strlen(query);
+    if (query_length == 0)
+    {
+        (void) printf("%s", text);
+        return;
+    }
+
+    const char* cursor = text;
+    for (const char* hit = strstr(cursor, query); hit != NULL;
+         hit = strstr(cursor, query))
+    {
+        (void) printf("%.*s", (int) (hit - cursor), cursor);
+        (void) printf("\x1b[1;33m%.*s\x1b[0m", (int) query_length, hit);
+        cursor = hit + query_length;
+    }
+
+    (void) printf("%s", cursor);
+}
+
 static size_t render_menu(const struct MatchList* matches, size_t highlight,
                           size_t top, size_t visible, size_t cols,
-                          size_t previous_height)
+                          const char* query, size_t previous_height)
 {
     if (previous_height > 0)
         (void) printf("\x1b[%zuA", previous_height);
@@ -707,7 +728,7 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
                 char cell[1024];
                 (void) fit(cell, sizeof(cell), current->preview[preview_index],
                            right_width);
-                (void) printf("%s", cell);
+                print_highlighted(cell, query);
             }
         }
 
@@ -783,7 +804,7 @@ static bool select_interactive(struct MatchList* matches, const char* query,
 
         load_preview(&matches->items[highlight], query);
 
-        previous_height = render_menu(matches, highlight, top, visible, cols,
+        previous_height = render_menu(matches, highlight, top, visible, cols, query,
                                       previous_height);
 
         char key = 0;
@@ -812,7 +833,7 @@ static bool select_interactive(struct MatchList* matches, const char* query,
             char sequence[2];
             if (read(STDIN_FILENO, &sequence[0], 1) == 1
                 && read(STDIN_FILENO, &sequence[1], 1) == 1
-                && sequence[0] == '[')
+                && (sequence[0] == '[' || sequence[0] == 'O'))
             {
                 if (sequence[1] == 'B' && highlight + 1 < matches->count)
                     highlight++;
