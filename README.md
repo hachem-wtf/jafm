@@ -12,4 +12,4 @@ That's it. I find it genuinely unacceptable that this is not an already solved i
 
 ## License
 
-JAFM is licensed under the MIT License. See [LICENSE](LICENSE) for more information.
+jafm is licensed under the MIT License. See [LICENSE](LICENSE) for more information.
