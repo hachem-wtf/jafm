@@ -34,6 +34,9 @@ CPPCHECKFLAGS := --error-exitcode=1              \
 TARGET := jafm
 SRC := jafm.c
 
+PREFIX ?= /usr/local
+BINDIR := $(DESTDIR)$(PREFIX)/bin
+
 all: $(TARGET)
 
 $(TARGET): $(SRC)
@@ -46,8 +49,15 @@ check:
 	bear -- make clean debug
 	cppcheck $(CPPCHECKFLAGS)
 
+install: $(TARGET)
+	install -d $(BINDIR)
+	install -m 755 $(TARGET) $(BINDIR)/$(TARGET)
+
+uninstall:
+	rm -f $(BINDIR)/$(TARGET)
+
 clean:
 	rm -rf $(TARGET) $(TARGET).dSYM
 
-.PHONY: all debug check clean
+.PHONY: all debug check install uninstall clean
 

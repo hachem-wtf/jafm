@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <dirent.h>
+#include <getopt.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -12,6 +13,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define JAFM_VERSION "0.1.0"
+#define JAFM_TAGLINE "just a fucking manual"
+#define JAFM_AUTHOR "hachem <im@hachem.wtf>"
 
 #define MAX_VISIBLE 12
 #define WORKER_THREADS 8
@@ -164,7 +169,9 @@ static void classify_kind(const char* line, const char* symbol, char* kind,
                           size_t kind_size)
 {
     const char* word = NULL;
-    if (strstr(line, "struct") != NULL)
+    if (strncmp(line, ".Fn", 3) == 0 || strncmp(line, ".Fo", 3) == 0)
+        word = "function";
+    else if (strstr(line, "struct") != NULL)
         word = "struct";
     else if (strstr(line, "union") != NULL)
         word = "union";
@@ -200,6 +207,10 @@ struct Scan
     int best_tier;
     char symbol[SYMBOL_SIZE];
     char kind[KIND_SIZE];
+    const char* want_kind;
+    bool has_wanted;
+    int best_wanted_tier;
+    char wanted_symbol[SYMBOL_SIZE];
 };
 
 struct Finding
@@ -249,6 +260,22 @@ static void scan_line(struct Scan* scan, const char* line, const char* query)
         scan->best_tier = tier;
         extract_symbol(line, query, scan->symbol, sizeof(scan->symbol));
         classify_kind(line, scan->symbol, scan->kind, sizeof(scan->kind));
+    }
+
+    if (scan->want_kind != NULL && tier > scan->best_wanted_tier)
+    {
+        char symbol[SYMBOL_SIZE];
+        char kind[KIND_SIZE];
+        extract_symbol(line, query, symbol, sizeof(symbol));
+        classify_kind(line, symbol, kind, sizeof(kind));
+
+        if (strcmp(kind, scan->want_kind) == 0)
+        {
+            scan->best_wanted_tier = tier;
+            scan->has_wanted = true;
+            (void) snprintf(scan->wanted_symbol, sizeof(scan->wanted_symbol), "%s",
+                            symbol);
+        }
     }
 }
 
@@ -354,15 +381,29 @@ static void scan_buffer(char* buffer, const char* query, struct Scan* scan)
     }
 }
 
-static void page_find(const char* path, const char* query, struct Finding* finding)
+static void page_find(const char* path, const char* query, const char* want_kind,
+                      struct Finding* finding)
 {
     char* buffer = ends_with(path, ".gz") ? read_gzip(path) : read_plain(path);
     if (buffer == NULL)
         return;
 
     struct Scan scan = {0};
+    scan.want_kind = want_kind;
     scan_buffer(buffer, query, &scan);
     free(buffer);
+
+    if (want_kind != NULL)
+    {
+        if (!scan.has_wanted)
+            return;
+
+        finding->score = scan_score(&scan);
+        (void) snprintf(finding->symbol, sizeof(finding->symbol), "%s",
+                        scan.wanted_symbol);
+        (void) snprintf(finding->kind, sizeof(finding->kind), "%s", want_kind);
+        return;
+    }
 
     finding->score = scan_score(&scan);
     (void) snprintf(finding->symbol, sizeof(finding->symbol), "%s", scan.symbol);
@@ -711,11 +752,14 @@ static void collect_sections(const char* directory, struct TaskList* tasks)
 }
 
 static void scan_task(const struct Task* task, const char* query,
-                      struct MatchList* matches)
+                      const char* want_kind, struct MatchList* matches)
 {
     const char* path = task->path;
     struct Finding finding = {0};
-    page_find(path, query, &finding);
+    page_find(path, query, want_kind, &finding);
+
+    if (want_kind != NULL && finding.score == 0)
+        return;
 
     long score = finding.score * task->weight;
 
@@ -738,6 +782,7 @@ struct Worker
     size_t start;
     size_t end;
     const char* query;
+    const char* want_kind;
     struct MatchList matches;
 };
 
@@ -745,7 +790,8 @@ static void* worker_main(void* argument)
 {
     struct Worker* worker = argument;
     for (size_t index = worker->start; index < worker->end; index++)
-        scan_task(&worker->tasks[index], worker->query, &worker->matches);
+        scan_task(&worker->tasks[index], worker->query, worker->want_kind,
+                  &worker->matches);
 
     return NULL;
 }
@@ -762,7 +808,8 @@ static size_t worker_count(size_t task_count, size_t requested)
 }
 
 static void scan_tasks(const struct TaskList* tasks, const char* query,
-                       struct MatchList* matches, size_t requested)
+                       const char* want_kind, struct MatchList* matches,
+                       size_t requested)
 {
     size_t threads = worker_count(tasks->count, requested);
 
@@ -785,6 +832,7 @@ static void scan_tasks(const struct TaskList* tasks, const char* query,
         workers[index].start = offset;
         workers[index].end = offset + chunk;
         workers[index].query = query;
+        workers[index].want_kind = want_kind;
         offset += chunk;
         (void) pthread_create(&handles[index], NULL, worker_main, &workers[index]);
     }
@@ -880,39 +928,133 @@ static int open_page(const char* path)
     return 1;
 }
 
+static bool is_valid_kind(const char* kind)
+{
+    static const char* kinds[] = {"struct", "union", "enum", "typedef", "function"};
+    for (size_t index = 0; index < sizeof(kinds) / sizeof(kinds[0]); index++)
+        if (strcmp(kind, kinds[index]) == 0)
+            return true;
+
+    return false;
+}
+
+static void print_usage(FILE* stream, const char* program)
+{
+    (void) fprintf(stream, "usage: %s [-1] [-l] [-t type] [-j threads] <symbol>\n",
+                   program);
+    (void) fprintf(stream, "       %s [-v | -h]\n", program);
+}
+
+static void print_help(const char* program)
+{
+    (void) printf("jafm %s - %s\n\n", JAFM_VERSION, JAFM_TAGLINE);
+    (void) printf("greps your whole manpath for a symbol and opens the page that actually\n"
+                  "documents it, because `man <symbol>` gives up way too easily.\n\n");
+    print_usage(stdout, program);
+    (void) printf("\noptions:\n"
+                  "  -1, --first      open the best match without asking\n"
+                  "  -l, --list       just print what it found, open nothing\n"
+                  "  -t, --type KIND  only show matches where the symbol is a KIND\n"
+                  "                   (struct, union, enum, typedef, function)\n"
+                  "  -j, --jobs N     scan with N worker threads (default %d)\n"
+                  "  -v, --version    print version and bail\n"
+                  "  -h, --help       print this and bail\n"
+                  "\nby %s\n",
+                  WORKER_THREADS, JAFM_AUTHOR);
+}
+
+static void print_match_list(const struct MatchList* matches, bool numbered)
+{
+    for (size_t index = 0; index < matches->count; index++)
+    {
+        char label[256];
+        page_label(matches->items[index].path, label, sizeof(label));
+
+        const char* symbol = matches->items[index].symbol;
+        const char* kind = matches->items[index].kind;
+
+        if (numbered)
+            (void) printf("%zu) ", index + 1);
+
+        if (symbol[0] != '\0')
+            (void) printf("%s  %s (%s)\n", label, symbol, kind);
+        else
+            (void) printf("%s\n", label);
+    }
+}
+
 int main(int argc, char** argv)
 {
-    size_t requested_threads = 0;
-
-    for (int option = getopt(argc, argv, "j:"); option != -1;
-         option = getopt(argc, argv, "j:"))
+    static const struct option long_options[] =
     {
-        if (option != 'j')
-        {
-            (void) fprintf(stderr, "usage: %s [-j threads] <symbol>\n", argv[0]);
-            return 1;
-        }
+        { "first",   no_argument,       NULL, '1'},
+        { "list",    no_argument,       NULL, 'l'},
+        { "type",    required_argument, NULL, 't'},
+        { "jobs",    required_argument, NULL, 'j'},
+        { "version", no_argument,       NULL, 'v'},
+        { "help",    no_argument,       NULL, 'h'},
+        { NULL,      0,                 NULL,  0 }
+    };
 
-        char* end = NULL;
-        long value = strtol(optarg, &end, 10);
-        if (end == optarg || *end != '\0' || value < 1)
-        {
-            (void) fprintf(stderr, "jafm: invalid thread count: %s\n", optarg);
-            return 1;
-        }
+    size_t requested_threads = 0;
+    bool open_first = false;
+    bool list_only = false;
+    const char* want_kind = NULL;
 
-        requested_threads = (size_t) value;
-    }
+    for (int option = getopt_long(argc, argv, "1lt:j:vh", long_options, NULL);
+         option != -1;
+         option = getopt_long(argc, argv, "1lt:j:vh", long_options, NULL))
+        switch (option)
+        {
+            case '1':
+                open_first = true;
+                break;
+            case 'l':
+                list_only = true;
+                break;
+            case 't':
+                if (!is_valid_kind(optarg))
+                {
+                    (void) fprintf(stderr, "jafm: invalid type: %s "
+                                   "(struct, union, enum, typedef, function)\n",
+                                   optarg);
+                    return 1;
+                }
+                want_kind = optarg;
+                break;
+            case 'j':
+            {
+                char* end = NULL;
+                long value = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || value < 1)
+                {
+                    (void) fprintf(stderr, "jafm: invalid thread count: %s\n", optarg);
+                    return 1;
+                }
+                requested_threads = (size_t) value;
+                break;
+            }
+            case 'v':
+                (void) printf("jafm %s - %s\n", JAFM_VERSION, JAFM_TAGLINE);
+                (void) printf("by %s\n", JAFM_AUTHOR);
+                return 0;
+            case 'h':
+                print_help(argv[0]);
+                return 0;
+            default:
+                print_usage(stderr, argv[0]);
+                return 1;
+        }
 
     if (optind != argc - 1)
     {
-        (void) fprintf(stderr, "usage: %s [-j threads] <symbol>\n", argv[0]);
+        print_usage(stderr, argv[0]);
         return 1;
     }
 
     const char* query = argv[optind];
 
-    FILE* manpath_pipe = popen("manpath", "r");
+    FILE* manpath_pipe = popen("manpath 2>/dev/null", "r");
     if (manpath_pipe == NULL)
     {
         (void) fprintf(stderr, "jafm: failed to run manpath\n");
@@ -940,7 +1082,7 @@ int main(int argc, char** argv)
         collect_sections(directory, &tasks);
 
     struct MatchList matches = {0};
-    scan_tasks(&tasks, query, &matches, requested_threads);
+    scan_tasks(&tasks, query, want_kind, &matches, requested_threads);
     task_list_free(&tasks);
 
     if (matches.count == 0)
@@ -953,24 +1095,22 @@ int main(int argc, char** argv)
     qsort(matches.items, matches.count, sizeof(struct Match), compare_matches);
     dedupe_matches(&matches);
 
+    if (list_only)
+    {
+        print_match_list(&matches, false);
+        match_list_free(&matches);
+        return 0;
+    }
+
     size_t selected = 0;
     bool has_selection;
-    if (isatty(STDIN_FILENO))
+    if (open_first)
+        has_selection = true;
+    else if (isatty(STDIN_FILENO))
         has_selection = select_interactive(&matches, &selected);
     else
     {
-        for (size_t index = 0; index < matches.count; index++)
-        {
-            char label[256];
-            page_label(matches.items[index].path, label, sizeof(label));
-
-            const char* symbol = matches.items[index].symbol;
-            const char* kind = matches.items[index].kind;
-            if (symbol[0] != '\0')
-                (void) printf("%zu) %s  %s (%s)\n", index + 1, label, symbol, kind);
-            else
-                (void) printf("%zu) %s\n", index + 1, label);
-        }
+        print_match_list(&matches, true);
         has_selection = read_selection(matches.count, &selected);
     }
 
