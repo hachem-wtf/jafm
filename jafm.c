@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -196,6 +197,13 @@ static void extract_symbol(const char* line, const char* query, bool exact,
     const char* end = found + strlen(query);
     while (is_identifier_char(*end))
         end++;
+
+    if (start > line && start[-1] == '\\' && start[0] == 'f')
+    {
+        start += start[1] == '(' ? 4 : 2;
+        if (start > end)
+            start = end;
+    }
 
     size_t length = (size_t) (end - start);
     if (length >= symbol_size)
@@ -490,10 +498,28 @@ static bool filename_matches(const char* name, const char* query)
 }
 
 static struct termios original_termios;
+static volatile sig_atomic_t raw_mode_active = 0;
+
+static void restore_terminal(void)
+{
+    if (!raw_mode_active)
+        return;
+
+    (void) tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+    (void) write(STDOUT_FILENO, "\x1b[?25h", 6);
+    raw_mode_active = 0;
+}
+
+static void handle_signal(int signal_number)
+{
+    restore_terminal();
+    (void) signal(signal_number, SIG_DFL);
+    (void) raise(signal_number);
+}
 
 static void disable_raw_mode(void)
 {
-    (void) tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+    restore_terminal();
 }
 
 static bool enable_raw_mode(void)
@@ -508,6 +534,14 @@ static bool enable_raw_mode(void)
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
         return false;
+
+    raw_mode_active = 1;
+    (void) write(STDOUT_FILENO, "\x1b[?25l", 6);
+
+    (void) signal(SIGINT, handle_signal);
+    (void) signal(SIGTERM, handle_signal);
+    (void) signal(SIGHUP, handle_signal);
+    (void) signal(SIGQUIT, handle_signal);
 
     return true;
 }
@@ -806,6 +840,7 @@ static bool select_interactive(struct MatchList* matches, const char* query,
 
         previous_height = render_menu(matches, highlight, top, visible, cols, query,
                                       previous_height);
+        (void) fflush(stdout);
 
         char key = 0;
         if (read(STDIN_FILENO, &key, 1) != 1)
@@ -845,6 +880,7 @@ static bool select_interactive(struct MatchList* matches, const char* query,
 
     if (previous_height > 0)
         (void) printf("\x1b[%zuA\r\x1b[J", previous_height);
+    (void) fflush(stdout);
 
     disable_raw_mode();
 
