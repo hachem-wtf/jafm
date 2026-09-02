@@ -19,6 +19,8 @@
 #define JAFM_AUTHOR "hachem <im@hachem.wtf>"
 
 #define MAX_VISIBLE 12
+#define PANEL_MIN_WIDTH 74
+#define LIST_WIDTH 44
 #define WORKER_THREADS 8
 #define MAX_WORKER_THREADS 64
 #define SYMBOL_SIZE 128
@@ -41,6 +43,10 @@ struct Match
     long score;
     char symbol[SYMBOL_SIZE];
     char kind[KIND_SIZE];
+    char** preview;
+    size_t preview_count;
+    size_t preview_start;
+    bool preview_loaded;
 };
 
 struct MatchList
@@ -74,14 +80,27 @@ static bool match_list_add(struct MatchList* matches, const char* path, long sco
     item->score = score;
     (void) snprintf(item->symbol, sizeof(item->symbol), "%s", symbol);
     (void) snprintf(item->kind, sizeof(item->kind), "%s", kind);
+    item->preview = NULL;
+    item->preview_count = 0;
+    item->preview_start = 0;
+    item->preview_loaded = false;
     matches->count++;
     return true;
+}
+
+static void match_free(struct Match* match)
+{
+    for (size_t index = 0; index < match->preview_count; index++)
+        free(match->preview[index]);
+
+    free(match->preview);
+    free(match->path);
 }
 
 static void match_list_free(struct MatchList* matches)
 {
     for (size_t index = 0; index < matches->count; index++)
-        free(matches->items[index].path);
+        match_free(&matches->items[index]);
 
     free(matches->items);
 }
@@ -530,6 +549,91 @@ static void page_label(const char* path, char* label, size_t label_size)
         (void) snprintf(label, label_size, "%s", base);
 }
 
+static void load_preview(struct Match* match, const char* query);
+
+static size_t fit(char* out, size_t out_size, const char* source, size_t width)
+{
+    size_t column = 0;
+    size_t offset = 0;
+
+    for (const char* cursor = source; *cursor != '\0' && column < width; cursor++)
+    {
+        unsigned char character = (unsigned char) *cursor;
+
+        if (character == '\t')
+        {
+            size_t spaces = 8 - (column % 8);
+            while (spaces > 0 && column < width && offset + 1 < out_size)
+            {
+                out[offset++] = ' ';
+                column++;
+                spaces--;
+            }
+        }
+        else if (character >= 32 && character < 127)
+        {
+            if (offset + 1 < out_size)
+            {
+                out[offset++] = *cursor;
+                column++;
+            }
+        }
+        else if (character >= 128)
+        {
+            if (offset + 1 < out_size)
+            {
+                out[offset++] = *cursor;
+                if ((character & 0xC0) != 0x80)
+                    column++;
+            }
+        }
+    }
+
+    out[offset] = '\0';
+    return column;
+}
+
+static size_t print_segment(const char* text, const char* color, size_t remaining)
+{
+    if (remaining == 0)
+        return 0;
+
+    char buffer[512];
+    size_t width = fit(buffer, sizeof(buffer), text, remaining);
+    if (width == 0)
+        return 0;
+
+    if (color[0] != '\0')
+        (void) printf("%s%s\x1b[0m", color, buffer);
+    else
+        (void) printf("%s", buffer);
+
+    return width;
+}
+
+static size_t print_list_cell(const struct Match* item, bool selected, size_t budget)
+{
+    char label[256];
+    page_label(item->path, label, sizeof(label));
+
+    size_t used = print_segment(label, selected ? "\x1b[1m" : "\x1b[2m", budget);
+
+    if (item->symbol[0] != '\0')
+    {
+        used += print_segment("  ", "", budget - used);
+        used += print_segment(item->symbol, "\x1b[33m", budget - used);
+
+        if (item->kind[0] != '\0')
+        {
+            char kind[KIND_SIZE + 3];
+            (void) snprintf(kind, sizeof(kind), " (%s)", item->kind);
+            used += print_segment(kind, "\x1b[2m", budget - used);
+        }
+    }
+
+    return used;
+}
+
 static size_t render_menu(const struct MatchList* matches, size_t highlight,
                           size_t top, size_t visible, size_t cols,
                           size_t previous_height)
@@ -537,6 +641,23 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
     if (previous_height > 0)
         (void) printf("\x1b[%zuA", previous_height);
 
+    size_t indent = 2;
+    size_t usable = cols > indent + 1 ? cols - indent - 1 : 0;
+    bool panel = usable >= PANEL_MIN_WIDTH;
+    size_t separator = 3;
+
+    size_t left_width = usable;
+    if (panel)
+    {
+        left_width = usable * 2 / 5;
+        if (left_width < LIST_WIDTH)
+            left_width = LIST_WIDTH;
+        if (left_width > 64)
+            left_width = 64;
+    }
+    size_t right_width = panel ? usable - left_width - separator : 0;
+
+    const struct Match* current = &matches->items[highlight];
     size_t height = 0;
 
     (void) printf("\r\x1b[2K  \x1b[1;36mjafm\x1b[0m \x1b[2m%zu matches\x1b[0m\r\n",
@@ -550,53 +671,90 @@ static size_t render_menu(const struct MatchList* matches, size_t highlight,
     if (end > matches->count)
         end = matches->count;
 
-    for (size_t index = top; index < end; index++)
+    for (size_t row = 0; row < visible; row++)
     {
-        char label[256];
-        page_label(matches->items[index].path, label, sizeof(label));
+        (void) printf("\x1b[2K  ");
 
-        const char* symbol = matches->items[index].symbol;
-        const char* kind = matches->items[index].kind;
+        size_t list_index = top + row;
+        if (list_index < end)
+        {
+            bool selected = list_index == highlight;
 
-        char detail[SYMBOL_SIZE + KIND_SIZE + 32];
-        if (symbol[0] != '\0' && kind[0] != '\0')
-            (void) snprintf(detail, sizeof(detail),
-                            "  \x1b[33m%s\x1b[0m \x1b[2m%s\x1b[0m", symbol, kind);
-        else if (symbol[0] != '\0')
-            (void) snprintf(detail, sizeof(detail), "  \x1b[33m%s\x1b[0m", symbol);
-        else
-            detail[0] = '\0';
+            if (selected)
+                (void) printf("\x1b[36m\xe2\x9d\xaf\x1b[0m ");
+            else
+                (void) printf("  ");
 
-        if (index == highlight)
-            (void) printf("\x1b[2K  \x1b[36m\xe2\x9d\xaf\x1b[0m \x1b[1m%s\x1b[0m%s\r\n",
-                          label, detail);
-        else
-            (void) printf("\x1b[2K    \x1b[2m%s\x1b[0m%s\r\n", label, detail);
+            size_t budget = left_width > 2 ? left_width - 2 : 0;
+            size_t used = print_list_cell(&matches->items[list_index], selected,
+                                          budget);
 
+            if (panel)
+                for (size_t pad = used + 2; pad < left_width; pad++)
+                    (void) putchar(' ');
+        }
+        else if (panel)
+            for (size_t pad = 0; pad < left_width; pad++)
+                (void) putchar(' ');
+
+        if (panel)
+        {
+            (void) printf("\x1b[2m \xe2\x94\x82\x1b[0m ");
+
+            size_t preview_index = current->preview_start + row;
+            if (current->preview_loaded && preview_index < current->preview_count)
+            {
+                char cell[1024];
+                (void) fit(cell, sizeof(cell), current->preview[preview_index],
+                           right_width);
+                (void) printf("%s", cell);
+            }
+        }
+
+        (void) printf("\r\n");
         height++;
     }
-
-    const char* path = matches->items[highlight].path;
-    size_t path_length = strlen(path);
-    size_t budget = cols > 4 ? cols - 4 : 0;
-    bool truncated = path_length > budget;
-    const char* shown = truncated ? path + (path_length - budget + 1) : path;
 
     (void) printf("\x1b[2K\r\n");
     height++;
 
-    (void) printf("\x1b[2K  \x1b[2m%s%s\x1b[0m\r\n", truncated ? "\xe2\x80\xa6" : "", shown);
+    (void) printf("\x1b[2K  ");
+    const char* path = current->path;
+    const char* slash = strrchr(path, '/');
+    if (slash != NULL)
+    {
+        char directory[1024];
+        (void) snprintf(directory, sizeof(directory), "%.*s",
+                        (int) (slash - path + 1), path);
+        size_t used = print_segment(directory, "\x1b[2m", usable);
+        (void) print_segment(slash + 1, "\x1b[1;36m", usable - used);
+    }
+    else
+        (void) print_segment(path, "\x1b[1;36m", usable);
+    (void) printf("\r\n");
     height++;
 
-    (void) printf("\x1b[2K  \x1b[2mup/down move  enter open  q quit  [%zu/%zu]\x1b[0m\r\n",
-                  highlight + 1, matches->count);
+    (void) printf("\x1b[2K  ");
+    size_t used = 0;
+    used += print_segment("up/down", "\x1b[36m", usable - used);
+    used += print_segment(" move  ", "\x1b[2m", usable - used);
+    used += print_segment("enter", "\x1b[36m", usable - used);
+    used += print_segment(" open  ", "\x1b[2m", usable - used);
+    used += print_segment("q", "\x1b[36m", usable - used);
+    used += print_segment(" quit  ", "\x1b[2m", usable - used);
+    char counter[32];
+    (void) snprintf(counter, sizeof(counter), "[%zu/%zu]", highlight + 1,
+                    matches->count);
+    (void) print_segment(counter, "\x1b[32m", usable - used);
+    (void) printf("\r\n");
     height++;
 
     (void) printf("\x1b[J");
     return height;
 }
 
-static bool select_interactive(const struct MatchList* matches, size_t* selected)
+static bool select_interactive(struct MatchList* matches, const char* query,
+                               size_t* selected)
 {
     if (!enable_raw_mode())
         return false;
@@ -622,6 +780,8 @@ static bool select_interactive(const struct MatchList* matches, size_t* selected
             top = highlight;
         else if (highlight >= top + visible)
             top = highlight - visible + 1;
+
+        load_preview(&matches->items[highlight], query);
 
         previous_height = render_menu(matches, highlight, top, visible, cols,
                                       previous_height);
@@ -904,7 +1064,7 @@ static void dedupe_matches(struct MatchList* matches)
             }
 
         if (seen)
-            free(matches->items[read].path);
+            match_free(&matches->items[read]);
         else
         {
             (void) snprintf(labels[write], sizeof(labels[write]), "%s", label);
@@ -917,7 +1077,9 @@ static void dedupe_matches(struct MatchList* matches)
     matches->count = write;
 }
 
-static int open_page(const char* path)
+static bool page_man_args(const char* path, char* root, size_t root_size,
+                          char* section, size_t section_size, char* name,
+                          size_t name_size)
 {
     char work[4096];
     (void) snprintf(work, sizeof(work), "%s", path);
@@ -928,29 +1090,101 @@ static int open_page(const char* path)
 
     char* name_slash = strrchr(work, '/');
     if (name_slash == NULL)
-        return 1;
+        return false;
 
     *name_slash = '\0';
-    char* name = name_slash + 1;
+    char* page_name = name_slash + 1;
 
-    char* section_dot = strrchr(name, '.');
+    char* section_dot = strrchr(page_name, '.');
     if (section_dot != NULL)
         *section_dot = '\0';
 
     char* root_slash = strrchr(work, '/');
     if (root_slash == NULL)
-        return 1;
+        return false;
 
     *root_slash = '\0';
-    char* root = work;
-    char* section = root_slash + 1;
-    if (strncmp(section, "man", 3) == 0)
-        section += 3;
+    char* page_section = root_slash + 1;
+    if (strncmp(page_section, "man", 3) == 0)
+        page_section += 3;
+
+    (void) snprintf(root, root_size, "%s", work);
+    (void) snprintf(section, section_size, "%s", page_section);
+    (void) snprintf(name, name_size, "%s", page_name);
+    return true;
+}
+
+static int open_page(const char* path)
+{
+    char root[4096];
+    char section[64];
+    char name[256];
+    if (!page_man_args(path, root, sizeof(root), section, sizeof(section), name,
+                       sizeof(name)))
+        return 1;
 
     (void) execlp("man", "man", "-M", root, section, name, (char*) NULL);
 
     (void) fprintf(stderr, "jafm: failed to run man\n");
     return 1;
+}
+
+static void load_preview(struct Match* match, const char* query)
+{
+    if (match->preview_loaded)
+        return;
+
+    match->preview_loaded = true;
+
+    char root[4096];
+    char section[64];
+    char name[256];
+    if (!page_man_args(match->path, root, sizeof(root), section, sizeof(section),
+                       name, sizeof(name)))
+        return;
+
+    char command[8192];
+    (void) snprintf(command, sizeof(command),
+                    "man -M '%s' '%s' '%s' 2>/dev/null | col -b", root, section,
+                    name);
+
+    FILE* pipe = popen(command, "r");
+    if (pipe == NULL)
+        return;
+
+    size_t capacity = 0;
+    bool found_start = false;
+    char line[4096];
+    while (fgets(line, sizeof(line), pipe) != NULL)
+    {
+        line[strcspn(line, "\n")] = '\0';
+
+        if (match->preview_count == capacity)
+        {
+            size_t new_capacity = capacity == 0 ? 64 : capacity * 2;
+            char** grown = realloc(match->preview, new_capacity * sizeof(char*));
+            if (grown == NULL)
+                break;
+
+            match->preview = grown;
+            capacity = new_capacity;
+        }
+
+        char* copy = strdup(line);
+        if (copy == NULL)
+            break;
+
+        if (!found_start && strstr(line, query) != NULL)
+        {
+            match->preview_start = match->preview_count;
+            found_start = true;
+        }
+
+        match->preview[match->preview_count] = copy;
+        match->preview_count++;
+    }
+
+    (void) pclose(pipe);
 }
 
 static bool is_valid_kind(const char* kind)
@@ -1139,7 +1373,7 @@ int main(int argc, char** argv)
     if (open_first)
         has_selection = true;
     else if (isatty(STDIN_FILENO))
-        has_selection = select_interactive(&matches, &selected);
+        has_selection = select_interactive(&matches, query, &selected);
     else
     {
         print_match_list(&matches, true);
