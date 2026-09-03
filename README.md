@@ -9,7 +9,7 @@ I find it genuinely insane how fucking illiterate the default `man` command can 
 $ jafm sockaddr
 ```
 
-That's it. I find it genuinely unacceptable that this is not an already solved issue.
+That's it. I find it genuinely unacceptable that this is not an already solved issue. Watch the demo [here](https://www.youtube.com/watch?v=ab9yrSoBfeY).
 
 ## What you get
 
